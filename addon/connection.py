@@ -51,6 +51,9 @@ from shared.constants import (
     FRAME_BUFFER_MAX_FRAMES, MAX_FRAMES_TO_DROP_PER_SECOND, FRAME_STALE_THRESHOLD_MS
 )
 
+# Must match server default (--api-key); server closes with AUTH_002 if no key in first 5s
+DEFAULT_SERVER_API_KEY = "sk-render-dev-2026"
+
 
 class RingBuffer:
     """Bounded ring buffer for frame data with FIFO eviction and metrics.
@@ -187,8 +190,8 @@ class Connection:
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
 
-        # Wait for connection (up to 10 seconds)
-        deadline = time.time() + 10.0
+        # Wait for TCP+TLS+auth (Tailscale / slow TLS can exceed 10s)
+        deadline = time.time() + 45.0
         while not self.connected and time.time() < deadline:
             time.sleep(0.1)
             # Check for connection errors
@@ -416,10 +419,15 @@ class Connection:
                     max_size=MAX_MESSAGE_SIZE,
                     ping_interval=HEARTBEAT_INTERVAL,
                     ping_timeout=HEARTBEAT_INTERVAL * 3,
-                    open_timeout=10,
+                    open_timeout=30,
                     ssl=ssl_context,
                 ) as ws:
                     self._ws = ws
+                    # Server waits up to 5s for first binary frame with api_key (server.py AUTH)
+                    key = self.api_key or DEFAULT_SERVER_API_KEY
+                    auth_msgs = pack_websocket(MsgType.PING, {"api_key": key})
+                    for part in auth_msgs:
+                        await ws.send(part)
                     self.connected = True
                     self._reconnect_attempts = 0
                     self._event_queue.put({"connected": True})
