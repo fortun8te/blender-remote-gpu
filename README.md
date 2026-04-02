@@ -42,6 +42,13 @@ See **[docs/README.md](docs/README.md)** for a full list of guides.
 
 Default dev **API key** and self-signed **TLS** are for private networks. Change `API_KEY`, use real certificates, and restrict access before exposing to the internet.
 
+## Troubleshooting connections
+
+- **TLS mismatch:** Server with TLS → client must use **`wss://`** (`USE_TLS = True` in `shared/dev_config.py`). Plain server (`python server/server.py --plain`) → client **`ws://`** (`USE_TLS = False`). Mismatch fails during handshake.
+- **Windows firewall:** Allow **inbound TCP 9876** on the GPU machine (Admin PowerShell):  
+  `netsh advfirewall firewall add rule name="Blender Remote GPU 9876" dir=in action=allow protocol=TCP localport=9876`
+- **Pull the addon** after `git pull` so fixes (auth, timeouts, `ws`/`wss`) are actually in Blender.
+
 ---
 
 **Suggested GitHub “About” description** (copy into the repository description field):

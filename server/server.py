@@ -46,6 +46,28 @@ setup_logging(
 logger = get_logger("server")
 
 
+def _authorization_header(websocket) -> str:
+    """Read Authorization header across websockets versions (request.headers vs legacy)."""
+    req = getattr(websocket, "request", None)
+    if req is not None:
+        headers = getattr(req, "headers", None)
+        if headers is not None:
+            # websockets Headers: case-insensitive get
+            v = headers.get("Authorization")
+            if v:
+                return str(v)
+    rh = getattr(websocket, "request_headers", None)
+    if rh is not None:
+        try:
+            d = dict(rh)
+            for k, v in d.items():
+                if str(k).lower() == "authorization":
+                    return str(v)
+        except Exception:
+            pass
+    return ""
+
+
 class ClientFrameBuffer:
     """Per-client frame buffer with overflow tracking and status reporting.
 
@@ -109,9 +131,16 @@ class ClientFrameBuffer:
 class RenderServer:
     """WebSocket server that accepts connections from Blender clients."""
 
-    def __init__(self, port: int = DEFAULT_PORT, blender_path: str = "blender", api_key: str = "sk-render-dev-2026"):
+    def __init__(
+        self,
+        port: int = DEFAULT_PORT,
+        blender_path: str = "blender",
+        api_key: str = "sk-render-dev-2026",
+        plain: bool = False,
+    ):
         self.port = port
         self.api_key = api_key
+        self.plain = plain
         self.scene_manager = SceneManager()
         self.final_renderer = SubprocessRenderer(blender_path)
         self.viewport_renderer = ViewportRenderer(blender_path)
@@ -156,8 +185,7 @@ class RenderServer:
             # API key validation (Issue #1)
             api_key_valid = False
             try:
-                headers = dict(websocket.request_headers) if hasattr(websocket, 'request_headers') else {}
-                auth_header = headers.get('Authorization', '')
+                auth_header = _authorization_header(websocket)
                 if auth_header.startswith('Bearer '):
                     api_key_valid = auth_header[7:] == self.api_key
 
@@ -659,21 +687,24 @@ class RenderServer:
 
         # TLS/SSL — prefer %TEMP%/blender-remote-gpu, fall back to legacy C:\tmp or /tmp
         ssl_context = None
+        if self.plain:
+            logger.info("TLS disabled (--plain); clients must use ws:// (no TLS)")
         _tls_dir = os.path.join(tempfile.gettempdir(), "blender-remote-gpu")
         os.makedirs(_tls_dir, exist_ok=True)
         ssl_keyfile = os.path.join(_tls_dir, "key.pem")
         ssl_certfile = os.path.join(_tls_dir, "cert.pem")
         _legacy_key = r"C:\tmp\key.pem" if os.name == "nt" else "/tmp/key.pem"
         _legacy_cert = r"C:\tmp\cert.pem" if os.name == "nt" else "/tmp/cert.pem"
-        if not (os.path.exists(ssl_keyfile) and os.path.exists(ssl_certfile)):
-            if os.path.exists(_legacy_key) and os.path.exists(_legacy_cert):
-                ssl_keyfile, ssl_certfile = _legacy_key, _legacy_cert
-        if os.path.exists(ssl_keyfile) and os.path.exists(ssl_certfile):
+        if not self.plain:
+            if not (os.path.exists(ssl_keyfile) and os.path.exists(ssl_certfile)):
+                if os.path.exists(_legacy_key) and os.path.exists(_legacy_cert):
+                    ssl_keyfile, ssl_certfile = _legacy_key, _legacy_cert
+        if not self.plain and os.path.exists(ssl_keyfile) and os.path.exists(ssl_certfile):
             import ssl
             ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             ssl_context.load_cert_chain(ssl_certfile, ssl_keyfile)
             logger.info("TLS enabled (self-signed cert)")
-        else:
+        elif not self.plain:
             # Try to generate self-signed cert if openssl is available
             try:
                 import subprocess
@@ -712,7 +743,16 @@ def main():
     parser.add_argument("--log-file", type=str, default=None, help="Log file path (default: console only)")
     parser.add_argument("--log-level", type=str, default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Log level")
     parser.add_argument("--json-logs", action="store_true", help="Use JSON log format")
-    parser.add_argument("--use-tls", action="store_true", help="Enable TLS (requires cert at /tmp/cert.pem)")
+    parser.add_argument(
+        "--plain",
+        action="store_true",
+        help="Disable TLS; listen for ws:// only (match addon USE_TLS=false).",
+    )
+    parser.add_argument(
+        "--use-tls",
+        action="store_true",
+        help="Ignored (kept for compatibility with old start_server.bat).",
+    )
     parser.add_argument("--api-key", type=str, default="sk-render-dev-2026", help="API key for authentication")
     args = parser.parse_args()
 
@@ -732,7 +772,12 @@ def main():
     logger.info(f"Log format: {'JSON' if args.json_logs else 'text'}")
 
     try:
-        server = RenderServer(port=args.port, blender_path=args.blender, api_key=args.api_key)
+        server = RenderServer(
+            port=args.port,
+            blender_path=args.blender,
+            api_key=args.api_key,
+            plain=args.plain,
+        )
         asyncio.run(server.start())
     except KeyboardInterrupt:
         logger.info("Server shutting down...")

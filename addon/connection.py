@@ -54,7 +54,7 @@ from shared.constants import (
     WS_CLIENT_OPEN_TIMEOUT, WS_CLIENT_CONNECT_WAIT, WS_PING_INTERVAL, WS_PING_TIMEOUT,
 )
 
-# Must match server default (--api-key); server closes with AUTH_002 if no key in first 5s
+# Must match server --api-key; server closes with AUTH_002 if no key in WS_AUTH_FIRST_MESSAGE_TIMEOUT
 DEFAULT_SERVER_API_KEY = "sk-render-dev-2026"
 
 
@@ -145,9 +145,11 @@ class Connection:
     """
 
     def __init__(self, url: str, api_key: str | None = None, use_tls: bool = True):
-        # Convert ws:// to wss:// if TLS enabled
+        # Align URL scheme with TLS (avoid wss:// to plaintext server or the reverse)
         if use_tls and url.startswith("ws://"):
             url = "wss://" + url[5:]
+        if not use_tls and url.startswith("wss://"):
+            url = "ws://" + url[6:]
 
         self.url = url
         self.api_key = api_key
@@ -186,7 +188,10 @@ class Connection:
         # Issue #11: Check if old thread is still alive and stop it before connecting again
         if self._thread is not None and self._thread.is_alive():
             self._stop_event.set()
-            self._thread.join(timeout=5.0)
+            for _ in range(40):
+                self._thread.join(timeout=0.25)
+                if not self._thread.is_alive():
+                    break
             self._thread = None
 
         self.last_error = None
@@ -402,7 +407,11 @@ class Connection:
 
     def _run_loop(self):
         """Background thread: manages async WebSocket I/O."""
-        _ensure_imports()  # Load websockets and msgpack on first use
+        try:
+            _ensure_imports()
+        except ImportError as e:
+            self._event_queue.put({"error": str(e)})
+            return
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
@@ -434,7 +443,7 @@ class Connection:
                     ssl=ssl_context,
                 ) as ws:
                     self._ws = ws
-                    # Server waits up to 5s for first binary frame with api_key (server.py AUTH)
+                    # Server auth: first binary frame must include api_key (see WS_AUTH_FIRST_MESSAGE_TIMEOUT)
                     key = self.api_key or DEFAULT_SERVER_API_KEY
                     auth_msgs = pack_websocket(MsgType.PING, {"api_key": key})
                     for part in auth_msgs:
@@ -464,6 +473,8 @@ class Connection:
 
     async def _async_attempt_reconnect(self):
         """Exponential backoff — must use asyncio.sleep (not time.sleep) in this loop."""
+        if self._stop_event.is_set():
+            return
         if self._reconnect_attempts < self._max_reconnect_attempts:
             self._reconnect_attempts += 1
             backoff = self._reconnect_backoff_ms * (2 ** (self._reconnect_attempts - 1))
@@ -474,7 +485,12 @@ class Connection:
                 f"Connection lost. Reconnecting in {backoff}ms "
                 f"(attempt {self._reconnect_attempts}/{self._max_reconnect_attempts})"
             )
-            await asyncio.sleep(backoff / 1000.0)
+            # Chunk sleep so close() / stop is responsive
+            remaining = backoff / 1000.0
+            while remaining > 0 and not self._stop_event.is_set():
+                step = min(remaining, 0.5)
+                await asyncio.sleep(step)
+                remaining -= step
 
     async def _send_loop(self, ws):
         """Send queued messages to server."""

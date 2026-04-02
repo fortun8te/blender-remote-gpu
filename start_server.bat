@@ -54,6 +54,6 @@ echo.
 echo Tailscale IP: Check 'tailscale ip' or 'tailscale status'
 echo.
 
-python server/server.py --port 9876 --use-tls
+python server/server.py --port 9876
 
 pause
