@@ -49,8 +49,9 @@ else:
 
 from shared.protocol import MsgType, pack_websocket, unpack_websocket
 from shared.constants import (
-    HEARTBEAT_INTERVAL, MAX_MESSAGE_SIZE, FRAME_BUFFER_SIZE_MS,
-    FRAME_BUFFER_MAX_FRAMES, MAX_FRAMES_TO_DROP_PER_SECOND, FRAME_STALE_THRESHOLD_MS
+    MAX_MESSAGE_SIZE, FRAME_BUFFER_SIZE_MS,
+    FRAME_BUFFER_MAX_FRAMES, MAX_FRAMES_TO_DROP_PER_SECOND, FRAME_STALE_THRESHOLD_MS,
+    WS_CLIENT_OPEN_TIMEOUT, WS_CLIENT_CONNECT_WAIT, WS_PING_INTERVAL, WS_PING_TIMEOUT,
 )
 
 # Must match server default (--api-key); server closes with AUTH_002 if no key in first 5s
@@ -194,14 +195,16 @@ class Connection:
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
 
-        # Wait for TCP+TLS+auth (Tailscale / slow TLS can exceed 10s)
-        deadline = time.time() + 45.0
+        deadline = time.time() + WS_CLIENT_CONNECT_WAIT
         while not self.connected and time.time() < deadline:
             time.sleep(0.1)
             while True:
                 try:
                     event = self._event_queue.get_nowait()
                     if event.get("error"):
+                        self._stop_event.set()
+                        if self._thread is not None:
+                            self._thread.join(timeout=8.0)
                         raise ConnectionError(event["error"])
                 except queue.Empty:
                     break
@@ -209,7 +212,7 @@ class Connection:
         if not self.connected:
             self._stop_event.set()
             if self._thread is not None:
-                self._thread.join(timeout=5.0)
+                self._thread.join(timeout=8.0)
             raise ConnectionError(f"Timed out connecting to {self.url}")
 
     def close(self):
@@ -425,9 +428,9 @@ class Connection:
                 async with websockets.connect(
                     self.url,
                     max_size=MAX_MESSAGE_SIZE,
-                    ping_interval=HEARTBEAT_INTERVAL,
-                    ping_timeout=HEARTBEAT_INTERVAL * 3,
-                    open_timeout=30,
+                    ping_interval=WS_PING_INTERVAL,
+                    ping_timeout=WS_PING_TIMEOUT,
+                    open_timeout=WS_CLIENT_OPEN_TIMEOUT,
                     ssl=ssl_context,
                 ) as ws:
                     self._ws = ws
@@ -446,8 +449,13 @@ class Connection:
                         self._send_loop(ws),
                         self._recv_loop(ws),
                     )
-            except websockets.exceptions.ConnectionClosed:
+            except websockets.exceptions.ConnectionClosed as e:
                 self.connected = False
+                code = getattr(e, "code", None)
+                reason = getattr(e, "reason", "") or ""
+                self._event_queue.put({
+                    "error": f"Server closed WebSocket (code {code}): {reason or 'no reason'}",
+                })
                 await self._async_attempt_reconnect()
             except Exception as e:
                 self.connected = False

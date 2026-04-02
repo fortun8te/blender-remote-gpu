@@ -5,7 +5,14 @@ VERSION = "0.1.0"
 # Network
 DEFAULT_PORT = 9876
 MAX_MESSAGE_SIZE = 500 * 1024 * 1024  # 500 MB (large .blend files)
-HEARTBEAT_INTERVAL = 5.0  # seconds
+HEARTBEAT_INTERVAL = 5.0  # seconds (legacy name; see WS_* below)
+
+# WebSocket tuning — Tailscale / cross-continent TLS can exceed defaults
+WS_AUTH_FIRST_MESSAGE_TIMEOUT = 30.0  # server waits for client auth (seconds)
+WS_CLIENT_OPEN_TIMEOUT = 60.0  # client TCP+TLS handshake (seconds)
+WS_CLIENT_CONNECT_WAIT = 90.0  # addon connect() blocks until connected (seconds)
+WS_PING_INTERVAL = 20.0  # application-level ping interval (seconds)
+WS_PING_TIMEOUT = 90.0  # must exceed worst-case Tailscale RTT
 
 # Rendering
 VIEWPORT_JPEG_QUALITY = 75
@@ -26,6 +33,11 @@ FRAME_STALE_THRESHOLD_MS = 500  # Skip frames received >500ms ago
 assert DEFAULT_PORT > 0, "DEFAULT_PORT must be > 0"
 assert MAX_MESSAGE_SIZE > 0, "MAX_MESSAGE_SIZE must be > 0"
 assert HEARTBEAT_INTERVAL > 0, "HEARTBEAT_INTERVAL must be > 0"
+assert WS_AUTH_FIRST_MESSAGE_TIMEOUT > 0, "WS_AUTH_FIRST_MESSAGE_TIMEOUT must be > 0"
+assert WS_CLIENT_OPEN_TIMEOUT > 0, "WS_CLIENT_OPEN_TIMEOUT must be > 0"
+assert WS_CLIENT_CONNECT_WAIT > 0, "WS_CLIENT_CONNECT_WAIT must be > 0"
+assert WS_PING_INTERVAL > 0, "WS_PING_INTERVAL must be > 0"
+assert WS_PING_TIMEOUT > 0, "WS_PING_TIMEOUT must be > 0"
 assert VIEWPORT_JPEG_QUALITY > 0, "VIEWPORT_JPEG_QUALITY must be > 0"
 assert VIEWPORT_UPDATE_INTERVAL > 0, "VIEWPORT_UPDATE_INTERVAL must be > 0"
 assert VIEWPORT_MAX_SAMPLES > 0, "VIEWPORT_MAX_SAMPLES must be > 0"

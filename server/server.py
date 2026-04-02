@@ -23,8 +23,9 @@ import msgpack
 
 from shared.protocol import MsgType, pack_websocket, unpack_websocket
 from shared.constants import (
-    DEFAULT_PORT, MAX_MESSAGE_SIZE, HEARTBEAT_INTERVAL,
-    FRAME_BUFFER_MAX_FRAMES, MAX_FRAMES_TO_DROP_PER_SECOND
+    DEFAULT_PORT, MAX_MESSAGE_SIZE,
+    FRAME_BUFFER_MAX_FRAMES, MAX_FRAMES_TO_DROP_PER_SECOND,
+    WS_AUTH_FIRST_MESSAGE_TIMEOUT, WS_PING_INTERVAL, WS_PING_TIMEOUT,
 )
 from shared.logging_config import setup_logging, get_logger, LogContext, log_error_with_code, log_performance
 from shared.error_codes import ErrorCodes
@@ -161,7 +162,9 @@ class RenderServer:
                     api_key_valid = auth_header[7:] == self.api_key
 
                 if not api_key_valid:
-                    first_msg = await asyncio.wait_for(websocket.recv(), timeout=5.0)
+                    first_msg = await asyncio.wait_for(
+                        websocket.recv(), timeout=WS_AUTH_FIRST_MESSAGE_TIMEOUT
+                    )
                     if isinstance(first_msg, bytes):
                         try:
                             _mt, data = unpack_websocket(first_msg)
@@ -181,7 +184,10 @@ class RenderServer:
                         await self._send_error(websocket, "AUTH_001", "Expected binary frame for authentication")
                         return
             except asyncio.TimeoutError:
-                ctx.log_error("No message received within 5s timeout")
+                ctx.log_error(
+                    f"No auth message within {WS_AUTH_FIRST_MESSAGE_TIMEOUT}s — "
+                    "client must send API key immediately after connect"
+                )
                 await self._send_error(websocket, "AUTH_002", "Connection timeout")
                 return
             except Exception as e:
@@ -648,7 +654,7 @@ class RenderServer:
         logger.info(f"Starting render server on port {self.port}...")
         logger.info(f"Blender: {self.final_renderer.blender_path}")
         logger.info(f"Max message size: {MAX_MESSAGE_SIZE} bytes")
-        logger.info(f"Heartbeat interval: {HEARTBEAT_INTERVAL}s")
+        logger.info(f"WebSocket ping: interval={WS_PING_INTERVAL}s timeout={WS_PING_TIMEOUT}s")
         logger.info(f"Waiting for client connection...")
 
         # TLS/SSL — prefer %TEMP%/blender-remote-gpu, fall back to legacy C:\tmp or /tmp
@@ -692,8 +698,8 @@ class RenderServer:
             "0.0.0.0",  # Listen on all interfaces (Tailscale handles filtering)
             self.port,
             max_size=MAX_MESSAGE_SIZE,
-            ping_interval=HEARTBEAT_INTERVAL,
-            ping_timeout=HEARTBEAT_INTERVAL * 3,
+            ping_interval=WS_PING_INTERVAL,
+            ping_timeout=WS_PING_TIMEOUT,
             ssl=ssl_context,
         ):
             await asyncio.Future()  # Run forever
