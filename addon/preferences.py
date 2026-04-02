@@ -10,8 +10,8 @@ class RemoteGPUPreferences(bpy.types.AddonPreferences):
 
     server_ip: StringProperty(
         name="Server IP",
-        description="IP address of the render server (LAN like 192.168.x.x or Tailscale like 100.x.x.x)",
-        default="192.168.1.100",
+        description="IP address of the render server (Tailscale like 100.x.x.x)",
+        default="100.74.135.83",
     )
     server_port: IntProperty(
         name="Port",
