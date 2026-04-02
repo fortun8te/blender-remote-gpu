@@ -38,7 +38,7 @@ logger = get_logger("engine")
 
 class RemoteRenderEngine(bpy.types.RenderEngine):
     bl_idname = "REMOTE_CYCLES"
-    bl_label = "Remote GPU"
+    bl_label = "Cycles REMOTE GPU"
     bl_use_preview = False  # No material preview for now
     bl_use_eevee_viewport = False
     bl_use_shading_nodes_custom = False

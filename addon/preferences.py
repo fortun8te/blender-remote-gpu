@@ -96,14 +96,15 @@ class REMOTEGPU_PT_connection_panel(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         try:
-            # Issue #8: Use .get() instead of direct dict access for safer addon lookup
-            addon = context.preferences.addons.get(__package__)
+            # Handle __package__ being None in certain Blender contexts
+            addon_name = __package__ if __package__ else "blender_remote_gpu"
+            addon = context.preferences.addons.get(addon_name)
             if addon is None:
-                layout.label(text="Addon not registered", icon="ERROR")
+                layout.label(text="Addon not found", icon="ERROR")
                 return
             prefs = addon.preferences
         except Exception as e:
-            layout.label(text=f"Error loading preferences: {e}", icon="ERROR")
+            layout.label(text=f"Error: {str(e)[:50]}", icon="ERROR")
             return
 
         # Connection settings
@@ -140,9 +141,11 @@ class REMOTEGPU_PT_connection_panel(bpy.types.Panel):
                     pct = int(100 * vram_used / total) if total > 0 else 0
                     col.label(text=f"VRAM: {vram_used}MB / {total}MB ({pct}%)")
         else:
+            col = box.column()
+            col.scale_y = 1.5
+            col.operator("remotegpu.connect", text="CONNECT TO SERVER", icon="URL")
             row = box.row()
-            row.operator("remotegpu.connect", text="Connect", icon="URL")
-            row.label(text="Disconnected")
+            row.label(text="Status: DISCONNECTED", icon="ERROR")
 
         # Network mode
         box = layout.box()
