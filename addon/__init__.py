@@ -38,42 +38,52 @@ classes = [
 
 
 def register():
-    for cls in classes:
-        bpy.utils.register_class(cls)
+    try:
+        for cls in classes:
+            try:
+                bpy.utils.register_class(cls)
+            except Exception as e:
+                print(f"[RemoteGPU] Failed to register {cls.__name__}: {e}")
+    except Exception as e:
+        print(f"[RemoteGPU] Registration error: {e}")
+        return
 
     # Auto-connect on startup if dev_config available and AUTO_CONNECT=True
     if HAS_DEV_CONFIG and dev_config and getattr(dev_config, 'AUTO_CONNECT', False):
-        ip = dev_config.REMOTE_SERVER_IP
-        port = dev_config.REMOTE_SERVER_PORT
-        use_tls = getattr(dev_config, 'USE_TLS', False)
-        api_key = getattr(dev_config, 'API_KEY', None)
-
-        print(f"[RemoteGPU] Auto-connecting to {ip}:{port} (TLS={'on' if use_tls else 'off'})")
         try:
-            # Set preferences from dev_config (addon folder name is "addon" when installed from ZIP)
-            addon_name = __name__ if __name__ else "addon"
-            prefs = bpy.context.preferences.addons[addon_name].preferences
-            prefs.server_ip = ip
-            prefs.server_port = port
-            if hasattr(prefs, 'denoiser_type'):
-                prefs.denoiser_type = dev_config.DEFAULT_DENOISER
-            if hasattr(prefs, 'denoiser_intensity'):
-                prefs.denoiser_intensity = dev_config.DEFAULT_DENOISER_INTENSITY
-            if hasattr(prefs, 'viewport_quality'):
-                prefs.viewport_quality = getattr(dev_config, 'VIEWPORT_QUALITY', 75)
+            ip = dev_config.REMOTE_SERVER_IP
+            port = dev_config.REMOTE_SERVER_PORT
+            use_tls = getattr(dev_config, 'USE_TLS', False)
+            api_key = getattr(dev_config, 'API_KEY', None)
 
-            # Build URL with correct protocol
-            protocol = "wss" if use_tls else "ws"
-            url = f"{protocol}://{ip}:{port}"
+            print(f"[RemoteGPU] Auto-connecting to {ip}:{port} (TLS={'on' if use_tls else 'off'})")
+            try:
+                # Set preferences from dev_config (addon folder name is "addon" when installed from ZIP)
+                addon_name = __name__ if __name__ else "addon"
+                prefs = bpy.context.preferences.addons[addon_name].preferences
+                prefs.server_ip = ip
+                prefs.server_port = port
+                if hasattr(prefs, 'denoiser_type'):
+                    prefs.denoiser_type = dev_config.DEFAULT_DENOISER
+                if hasattr(prefs, 'denoiser_intensity'):
+                    prefs.denoiser_intensity = dev_config.DEFAULT_DENOISER_INTENSITY
+                if hasattr(prefs, 'viewport_quality'):
+                    prefs.viewport_quality = getattr(dev_config, 'VIEWPORT_QUALITY', 75)
 
-            # Connect
-            from . import connection
-            conn = connection.Connection(url, api_key=api_key, use_tls=use_tls)
-            conn.connect()
-            engine.RemoteRenderEngine._connection = conn
-            print(f"[RemoteGPU] Connected to {ip}:{port}")
+                # Build URL with correct protocol
+                protocol = "wss" if use_tls else "ws"
+                url = f"{protocol}://{ip}:{port}"
+
+                # Connect
+                from . import connection
+                conn = connection.Connection(url, api_key=api_key, use_tls=use_tls)
+                conn.connect()
+                engine.RemoteRenderEngine._connection = conn
+                print(f"[RemoteGPU] Connected to {ip}:{port}")
+            except Exception as e:
+                print(f"[RemoteGPU] Auto-connect failed: {e}")
         except Exception as e:
-            print(f"[RemoteGPU] Auto-connect failed: {e}")
+            print(f"[RemoteGPU] Config error: {e}")
 
 
 def unregister():
