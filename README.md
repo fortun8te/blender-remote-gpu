@@ -42,10 +42,6 @@ See **[docs/README.md](docs/README.md)** for a full list of guides.
 
 Default dev **API key** and self-signed **TLS** are for private networks. Change `API_KEY`, use real certificates, and restrict access before exposing to the internet.
 
-## License
-
-Add a `LICENSE` file if you distribute this repo publicly.
-
 ---
 
 **Suggested GitHub “About” description** (copy into the repository description field):
