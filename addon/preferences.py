@@ -120,7 +120,8 @@ class REMOTEGPU_PT_connection_panel(bpy.types.Panel):
 
         # Connect/disconnect button
         from . import engine
-        conn = engine.RemoteRenderEngine._connection
+        with engine.RemoteRenderEngine._connection_lock:
+            conn = engine.RemoteRenderEngine._connection
         if conn is not None and conn.connected:
             row = box.row()
             row.operator("remotegpu.disconnect", text="Disconnect", icon="CANCEL")
@@ -267,16 +268,19 @@ class REMOTEGPU_OT_connect(bpy.types.Operator):
         protocol = "wss" if use_tls else "ws"
         url = f"{protocol}://{prefs.server_ip}:{prefs.server_port}"
 
-        # Issue #16: Close old connection before opening new one
-        old_conn = engine.RemoteRenderEngine._connection
-        if old_conn is not None:
-            old_conn.close()
-            engine.RemoteRenderEngine._connection = None
+        with engine.RemoteRenderEngine._connection_lock:
+            old_conn = engine.RemoteRenderEngine._connection
+            if old_conn is not None:
+                old_conn.close()
+                engine.RemoteRenderEngine._connection = None
+        engine.RemoteRenderEngine.reset_session_state()
 
         try:
             conn = Connection(url, api_key=api_key, use_tls=use_tls)
             conn.connect()
-            engine.RemoteRenderEngine._connection = conn
+            with engine.RemoteRenderEngine._connection_lock:
+                engine.RemoteRenderEngine._connection = conn
+            engine.RemoteRenderEngine.reset_session_state()
             self.report({"INFO"}, f"Connected to {prefs.server_ip}:{prefs.server_port}")
         except Exception as e:
             self.report({"ERROR"}, f"Connection failed: {e}")
@@ -293,11 +297,13 @@ class REMOTEGPU_OT_disconnect(bpy.types.Operator):
     def execute(self, context):
         from . import engine
 
-        conn = engine.RemoteRenderEngine._connection
-        if conn is not None:
-            conn.close()
-            engine.RemoteRenderEngine._connection = None
-            self.report({"INFO"}, "Disconnected")
+        with engine.RemoteRenderEngine._connection_lock:
+            conn = engine.RemoteRenderEngine._connection
+            if conn is not None:
+                conn.close()
+                engine.RemoteRenderEngine._connection = None
+        engine.RemoteRenderEngine.reset_session_state()
+        self.report({"INFO"}, "Disconnected")
 
         return {"FINISHED"}
 
@@ -311,10 +317,10 @@ class REMOTEGPU_OT_select_device(bpy.types.Operator):
 
     def execute(self, context):
         from . import engine
-        from .connection import Connection
-        from shared.protocol import MsgType, pack_websocket
+        from shared.protocol import MsgType
 
-        conn = engine.RemoteRenderEngine._connection
+        with engine.RemoteRenderEngine._connection_lock:
+            conn = engine.RemoteRenderEngine._connection
         if conn is None or not conn.connected:
             self.report({"ERROR"}, "Not connected to render server")
             return {"CANCELLED"}
@@ -324,15 +330,11 @@ class REMOTEGPU_OT_select_device(bpy.types.Operator):
             return {"CANCELLED"}
 
         try:
-            # Send RENDER_DEVICE_SELECT message to server
             msg_data = {
                 "backend": self.backend.upper(),
-                "device_idx": 0,  # Use first device of the backend
+                "device_idx": 0,
             }
-            messages = pack_websocket(MsgType.RENDER_DEVICE_SELECT, msg_data)
-            for msg in messages:
-                conn.websocket.send(msg)
-
+            conn.send(MsgType.RENDER_DEVICE_SELECT, msg_data)
             self.report({"INFO"}, f"Requesting GPU backend: {self.backend}")
             return {"FINISHED"}
 

@@ -39,11 +39,13 @@ if os.path.exists(_shared_dir):
     # Shared is a sibling of addon/ (dev layout)
     sys.path.insert(0, _addon_dir)
 else:
-    # Fallback: look in Blender scripts addons dir
-    import bpy
-    _scripts_dir = os.path.dirname(bpy.context.preferences.filepaths.script_directory)
-    if os.path.exists(os.path.join(_scripts_dir, "shared")):
-        sys.path.insert(0, _scripts_dir)
+    try:
+        import bpy
+        _scripts_dir = os.path.dirname(bpy.context.preferences.filepaths.script_directory)
+        if os.path.exists(os.path.join(_scripts_dir, "shared")):
+            sys.path.insert(0, _scripts_dir)
+    except Exception:
+        pass
 
 from shared.protocol import MsgType, pack_websocket, unpack_websocket
 from shared.constants import (
@@ -82,7 +84,7 @@ class RingBuffer:
             timestamp_sent: Time frame was sent from server (for latency calc)
 
         Returns:
-            True if frame was added, False if dropped
+            True if frame was stored successfully, False if oldest was evicted (overflow).
         """
         with self._lock:
             was_full = len(self._buffer) >= self.max_frames
@@ -172,6 +174,7 @@ class Connection:
         self._ws = None
         self._last_drop_log_time = time.time()
         self._current_latency_ms = 0.0
+        self.last_error: str | None = None
 
     def get_current_latency(self) -> float:
         """Get real-time latency in milliseconds."""
@@ -185,6 +188,7 @@ class Connection:
             self._thread.join(timeout=5.0)
             self._thread = None
 
+        self.last_error = None
         self._stop_event.clear()
         self._reconnect_attempts = 0
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
@@ -194,16 +198,18 @@ class Connection:
         deadline = time.time() + 45.0
         while not self.connected and time.time() < deadline:
             time.sleep(0.1)
-            # Check for connection errors
-            try:
-                event = self._event_queue.get_nowait()
-                if event.get("error"):
-                    raise ConnectionError(event["error"])
-            except queue.Empty:
-                pass
+            while True:
+                try:
+                    event = self._event_queue.get_nowait()
+                    if event.get("error"):
+                        raise ConnectionError(event["error"])
+                except queue.Empty:
+                    break
 
         if not self.connected:
             self._stop_event.set()
+            if self._thread is not None:
+                self._thread.join(timeout=5.0)
             raise ConnectionError(f"Timed out connecting to {self.url}")
 
     def close(self):
@@ -377,14 +383,16 @@ class Connection:
             try:
                 event = self._event_queue.get(timeout=0.5)
                 if event.get("type") == "final_frame":
+                    self.last_error = None
                     return event["data"], event["meta"]
                 if event.get("type") == "progress":
-                    # Could be used for progress callback
                     pass
                 if event.get("error"):
-                    raise RuntimeError(event["error"])
+                    self.last_error = str(event["error"])
+                    return None
             except queue.Empty:
                 continue
+        self.last_error = "Timed out waiting for final frame"
         return None
 
     # --- Background thread ---
@@ -428,6 +436,7 @@ class Connection:
                     auth_msgs = pack_websocket(MsgType.PING, {"api_key": key})
                     for part in auth_msgs:
                         await ws.send(part)
+                    self.last_error = None
                     self.connected = True
                     self._reconnect_attempts = 0
                     self._event_queue.put({"connected": True})
@@ -439,22 +448,25 @@ class Connection:
                     )
             except websockets.exceptions.ConnectionClosed:
                 self.connected = False
-                self._attempt_reconnect()
+                await self._async_attempt_reconnect()
             except Exception as e:
                 self.connected = False
                 self._event_queue.put({"error": str(e)})
-                self._attempt_reconnect()
+                await self._async_attempt_reconnect()
 
-    def _attempt_reconnect(self):
-        """Exponential backoff reconnect logic."""
+    async def _async_attempt_reconnect(self):
+        """Exponential backoff — must use asyncio.sleep (not time.sleep) in this loop."""
         if self._reconnect_attempts < self._max_reconnect_attempts:
             self._reconnect_attempts += 1
             backoff = self._reconnect_backoff_ms * (2 ** (self._reconnect_attempts - 1))
-            backoff = min(backoff, 30000)  # Cap at 30 seconds
+            backoff = min(backoff, 30000)
             import logging
             logger = logging.getLogger("connection")
-            logger.warning(f"Connection lost. Reconnecting in {backoff}ms (attempt {self._reconnect_attempts}/{self._max_reconnect_attempts})")
-            time.sleep(backoff / 1000.0)
+            logger.warning(
+                f"Connection lost. Reconnecting in {backoff}ms "
+                f"(attempt {self._reconnect_attempts}/{self._max_reconnect_attempts})"
+            )
+            await asyncio.sleep(backoff / 1000.0)
 
     async def _send_loop(self, ws):
         """Send queued messages to server."""

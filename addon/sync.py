@@ -175,6 +175,12 @@ def get_scene_tracker() -> SceneStateTracker | None:
     return _scene_tracker
 
 
+def clear_scene_tracker() -> None:
+    """Clear delta-sync baseline; call on disconnect so reconnect forces a full scene sync."""
+    global _scene_tracker
+    _scene_tracker = None
+
+
 def compute_scene_delta(context, max_delta_bytes: int = 1000000) -> SceneDelta | None:
     """Compute incremental scene changes since last full sync.
 

@@ -57,6 +57,13 @@ class RemoteRenderEngine(bpy.types.RenderEngine):
     _viewport_registry = None
     _textures: dict = {}  # viewport_id -> texture cache
 
+    @staticmethod
+    def reset_session_state():
+        """After disconnect/reconnect, force full scene sync (deltas require server baseline)."""
+        RemoteRenderEngine._scene_synced = False
+        from . import sync
+        sync.clear_scene_tracker()
+
     # --- Final Render (F12) ---
 
     def render(self, depsgraph):
@@ -65,7 +72,8 @@ class RemoteRenderEngine(bpy.types.RenderEngine):
         perf = PerformanceLogger(logger, f"final_render[{operation_id}]")
 
         with LogContext("final_render", logger, operation_id) as ctx:
-            conn = RemoteRenderEngine._connection
+            with RemoteRenderEngine._connection_lock:
+                conn = RemoteRenderEngine._connection
             if conn is None or not conn.connected:
                 ctx.log_error("Not connected to render server")
                 show_error("CONN_003", "Open Render Properties > Remote GPU > Connect")
@@ -152,8 +160,9 @@ class RemoteRenderEngine(bpy.types.RenderEngine):
                 perf.mark("render_received")
 
                 if result_data is None:
-                    ctx.log_error(f"Render timeout after {timeout_count}s")
-                    show_error("RENDER_003", f"No result after {max_timeout}s")
+                    err = conn.last_error or f"No result after {max_timeout}s"
+                    ctx.log_error(err)
+                    show_error("RENDER_003", err)
                     record_error("RENDER_003", "final_render", perf.mark("error"))
                     return
 
@@ -208,7 +217,8 @@ class RemoteRenderEngine(bpy.types.RenderEngine):
         operation_id = str(uuid.uuid4())[:12]
 
         with LogContext("view_update", logger, operation_id) as ctx:
-            conn = RemoteRenderEngine._connection
+            with RemoteRenderEngine._connection_lock:
+                conn = RemoteRenderEngine._connection
             if conn is None or not conn.connected:
                 ctx.log_debug("Not connected, skipping view update")
                 return
@@ -295,7 +305,8 @@ class RemoteRenderEngine(bpy.types.RenderEngine):
         fullscreen textured quad. Phase 12 — supports multiple viewports.
         """
         try:
-            conn = RemoteRenderEngine._connection
+            with RemoteRenderEngine._connection_lock:
+                conn = RemoteRenderEngine._connection
             region = context.region
 
             if region is None or region.width < 1 or region.height < 1:

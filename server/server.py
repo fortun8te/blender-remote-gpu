@@ -9,6 +9,7 @@ import asyncio
 import logging
 import os
 import sys
+import tempfile
 import time
 import signal
 import uuid
@@ -107,8 +108,9 @@ class ClientFrameBuffer:
 class RenderServer:
     """WebSocket server that accepts connections from Blender clients."""
 
-    def __init__(self, port: int = DEFAULT_PORT, blender_path: str = "blender"):
+    def __init__(self, port: int = DEFAULT_PORT, blender_path: str = "blender", api_key: str = "sk-render-dev-2026"):
         self.port = port
+        self.api_key = api_key
         self.scene_manager = SceneManager()
         self.final_renderer = SubprocessRenderer(blender_path)
         self.viewport_renderer = ViewportRenderer(blender_path)
@@ -153,19 +155,22 @@ class RenderServer:
             # API key validation (Issue #1)
             api_key_valid = False
             try:
-                # Check headers first (WebSocket upgrade headers)
                 headers = dict(websocket.request_headers) if hasattr(websocket, 'request_headers') else {}
                 auth_header = headers.get('Authorization', '')
                 if auth_header.startswith('Bearer '):
-                    api_key_valid = auth_header[7:] == "sk-render-dev-2026"
+                    api_key_valid = auth_header[7:] == self.api_key
 
-                # If not in headers, check first message
                 if not api_key_valid:
                     first_msg = await asyncio.wait_for(websocket.recv(), timeout=5.0)
                     if isinstance(first_msg, bytes):
-                        msg_type, data = unpack_websocket(first_msg)
+                        try:
+                            _mt, data = unpack_websocket(first_msg)
+                        except Exception as e:
+                            ctx.log_error(f"Invalid first message: {e}")
+                            await self._send_error(websocket, "AUTH_001", "Invalid message format")
+                            return
                         received_key = data.get("api_key", "")
-                        api_key_valid = received_key == "sk-render-dev-2026"
+                        api_key_valid = received_key == self.api_key
                         if api_key_valid:
                             ctx.log_info("API key validated via first message")
                         else:
@@ -173,14 +178,27 @@ class RenderServer:
                             await self._send_error(websocket, "AUTH_001", "Invalid API key")
                             return
                     else:
-                        # Non-first-msg, continue processing
-                        await self._handle_message(websocket, msg_type, data, None, session_id, frame_buffer)
+                        await self._send_error(websocket, "AUTH_001", "Expected binary frame for authentication")
+                        return
             except asyncio.TimeoutError:
                 ctx.log_error("No message received within 5s timeout")
                 await self._send_error(websocket, "AUTH_002", "Connection timeout")
                 return
             except Exception as e:
                 ctx.log_error(f"API key validation error: {e}")
+                logger.exception("Auth validation exception")
+                try:
+                    await self._send_error(websocket, "AUTH_001", f"Authentication failed: {e}")
+                except Exception:
+                    pass
+                return
+
+            if not api_key_valid:
+                try:
+                    await self._send_error(websocket, "AUTH_001", "Authentication required")
+                except Exception:
+                    pass
+                return
 
             try:
                 async for raw in websocket:
@@ -192,7 +210,7 @@ class RenderServer:
                             # Read binary follow-up if indicated
                             binary = None
                             if data.get("has_binary"):
-                                binary = await websocket.recv()
+                                binary = await asyncio.wait_for(websocket.recv(), timeout=600.0)
                                 ctx.log_debug(f"Binary payload: {len(binary)} bytes")
 
                             await self._handle_message(websocket, msg_type, data, binary, session_id, frame_buffer)
@@ -633,10 +651,17 @@ class RenderServer:
         logger.info(f"Heartbeat interval: {HEARTBEAT_INTERVAL}s")
         logger.info(f"Waiting for client connection...")
 
-        # TLS/SSL support (dev: self-signed, prod: proper certs) — Issue #3: TLS fallback
+        # TLS/SSL — prefer %TEMP%/blender-remote-gpu, fall back to legacy C:\tmp or /tmp
         ssl_context = None
-        ssl_keyfile = "/tmp/key.pem"
-        ssl_certfile = "/tmp/cert.pem"
+        _tls_dir = os.path.join(tempfile.gettempdir(), "blender-remote-gpu")
+        os.makedirs(_tls_dir, exist_ok=True)
+        ssl_keyfile = os.path.join(_tls_dir, "key.pem")
+        ssl_certfile = os.path.join(_tls_dir, "cert.pem")
+        _legacy_key = r"C:\tmp\key.pem" if os.name == "nt" else "/tmp/key.pem"
+        _legacy_cert = r"C:\tmp\cert.pem" if os.name == "nt" else "/tmp/cert.pem"
+        if not (os.path.exists(ssl_keyfile) and os.path.exists(ssl_certfile)):
+            if os.path.exists(_legacy_key) and os.path.exists(_legacy_cert):
+                ssl_keyfile, ssl_certfile = _legacy_key, _legacy_cert
         if os.path.exists(ssl_keyfile) and os.path.exists(ssl_certfile):
             import ssl
             ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -657,7 +682,10 @@ class RenderServer:
                 ssl_context.load_cert_chain(ssl_certfile, ssl_keyfile)
                 logger.info("TLS enabled (auto-generated self-signed cert)")
             except Exception as e:
-                logger.warning(f"TLS cert generation failed ({e}). TLS disabled. To enable, run: openssl req -x509 -newkey rsa:4096 -nodes -out /tmp/cert.pem -keyout /tmp/key.pem -days 365")
+                logger.warning(
+                    f"TLS cert generation failed ({e}). TLS disabled. "
+                    f"Install OpenSSL or place cert/key under {_tls_dir}"
+                )
 
         async with websockets.serve(
             self.handle_client,
@@ -698,7 +726,7 @@ def main():
     logger.info(f"Log format: {'JSON' if args.json_logs else 'text'}")
 
     try:
-        server = RenderServer(port=args.port, blender_path=args.blender)
+        server = RenderServer(port=args.port, blender_path=args.blender, api_key=args.api_key)
         asyncio.run(server.start())
     except KeyboardInterrupt:
         logger.info("Server shutting down...")

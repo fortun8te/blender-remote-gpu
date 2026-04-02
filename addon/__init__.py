@@ -78,7 +78,9 @@ def register():
                 from . import connection
                 conn = connection.Connection(url, api_key=api_key, use_tls=use_tls)
                 conn.connect()
-                engine.RemoteRenderEngine._connection = conn
+                with engine.RemoteRenderEngine._connection_lock:
+                    engine.RemoteRenderEngine._connection = conn
+                engine.RemoteRenderEngine.reset_session_state()
                 print(f"[RemoteGPU] Connected to {ip}:{port}")
             except Exception as e:
                 print(f"[RemoteGPU] Auto-connect failed: {e}")
@@ -87,10 +89,11 @@ def register():
 
 
 def unregister():
-    # Disconnect any active connection
-    if engine.RemoteRenderEngine._connection is not None:
-        engine.RemoteRenderEngine._connection.close()
-        engine.RemoteRenderEngine._connection = None
+    with engine.RemoteRenderEngine._connection_lock:
+        if engine.RemoteRenderEngine._connection is not None:
+            engine.RemoteRenderEngine._connection.close()
+            engine.RemoteRenderEngine._connection = None
+    engine.RemoteRenderEngine.reset_session_state()
 
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
