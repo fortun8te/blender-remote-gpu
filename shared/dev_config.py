@@ -11,8 +11,8 @@ USE_TAILSCALE = True
 # Mac Tailscale IP (for server to know client)
 LOCAL_CLIENT_IP = "100.119.65.49"  # macbook-pro-van-michael
 
-# Auto-connect on Blender startup
-AUTO_CONNECT = True
+# Auto-connect on Blender startup (disabled — manual connect more reliable)
+AUTO_CONNECT = False
 AUTO_RECONNECT = True
 RECONNECT_MAX_RETRIES = 10
 RECONNECT_BACKOFF_MS = 500
