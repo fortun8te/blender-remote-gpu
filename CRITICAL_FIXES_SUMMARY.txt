@@ -1,0 +1,137 @@
+╔════════════════════════════════════════════════════════════════════════════╗
+║  BLENDER REMOTE GPU ADDON — CRITICAL BUGS FOUND                            ║
+║  Audit Date: 2026-04-02 | Total Issues: 30 | Critical: 13 | High: 5       ║
+╚════════════════════════════════════════════════════════════════════════════╝
+
+⚠️  MUST FIX BEFORE RELEASE (13 Critical Issues):
+
+1. addon/sync.py:48-56
+   ❌ context.region can be None → AttributeError on region.width
+   ✓ Add: if region is None or rv3d is None: return defaults
+
+2. addon/engine.py:204
+   ❌ _draw_cached_frame() doesn't check region for None
+   ✓ Add: if region is None: return
+
+3. addon/engine.py:196
+   ❌ Zero-size viewport dimensions crash GPU texture creation
+   ✓ Add: if width <= 0 or height <= 0: return
+
+4. addon/engine.py:96
+   ❌ Pixel reshape assumes exact size match, crashes on mismatch
+   ✓ Validate: if len(pixels) != expected_size: error and return
+
+5. addon/connection.py:175-182
+   ❌ asyncio event loop may conflict with Blender 5+ event loop
+   ✓ Add: proper loop detection and error handling
+
+6. addon/engine.py:28
+   ❌ _connection class variable has race condition (no lock)
+   ✓ Add: threading.Lock() around all _connection access
+
+7. addon/engine.py:169-191
+   ❌ _last_texture used without initialization
+   ✓ Initialize in __init__: self._last_texture = None
+
+8. addon/engine.py:162-166
+   ❌ Frame decode exception handling doesn't recover
+   ✓ Add: exponential backoff + auto-reconnect trigger
+
+9. addon/sync.py:15-31
+   ❌ File I/O has no error handling (PermissionError, OSError)
+   ✓ Wrap in try/except with specific error messages
+
+10. addon/preferences.py:67
+    ❌ Direct dict access without existence check → KeyError
+    ✓ Use: try/except KeyError or .get() method
+
+11. addon/preferences.py:8
+    ❌ __package__ may be None or wrong for addon identification
+    ✓ Use: explicit bl_idname = "blender_remote_gpu"
+
+12. addon/preferences.py:97
+    ❌ Server might send vram_total=0 → division by zero risk
+    ✓ Verify: already has guard, but validate server response
+
+13. addon/engine.py:175
+    ❌ tag_redraw() called even when disconnected → CPU waste (60+ redraws/sec)
+    ✓ Add: if conn and conn.connected: tag_redraw()
+
+═══════════════════════════════════════════════════════════════════════════════
+
+🔴 HIGH SEVERITY (5 Issues):
+
+14. addon/connection.py:68-88
+    ❌ Double-connect: retry doesn't stop old thread
+    ✓ Check: if thread alive, set stop_event and join first
+
+15. addon/frame.py:20-22
+    ❌ JPEG corruption not handled (network errors, PIL differences)
+    ✓ Add: img.verify() before decode, wrap in try/except
+
+16. addon/connection.py:249-254
+    ❌ Frame queue drops silently (no logging of data loss)
+    ✓ Log: when frame is dropped from queue
+
+17. addon/engine.py:13
+    ❌ gpu_extras.presets.draw_texture_2d() doesn't exist in Blender 5.2+
+    ✓ Add: try/except ImportError with fallback
+
+18. addon/engine.py:59
+    ❌ bpy.context is None in CLI/background render mode
+    ✓ Use: depsgraph.scene instead of bpy.context.scene
+
+═══════════════════════════════════════════════════════════════════════════════
+
+🟡 MEDIUM SEVERITY (5 Issues):
+
+19. addon/frame.py:35-52
+    ❌ EXR decoder broken (PIL not suitable, wrong shape)
+    ✓ Implement: proper OpenEXR decoding
+
+20. addon/engine.py:70-74
+    ❌ No render timeout (waits 300 sec if server hangs)
+    ✓ Add: render_deadline = time.time() + 300
+
+21. addon/engine.py:52-53
+    ❌ No SCENE_ACK wait (render starts on old .blend)
+    ✓ Implement: get_scene_ack(timeout=30)
+
+22. addon/engine.py:63/88
+    ❌ Format mismatch: hardcoded PNG vs JPEG decode
+    ✓ Use: consistent EXR format end-to-end
+
+23. addon/preferences.py:140
+    ❌ Connect overwrites old connection without closing
+    ✓ Add: old_conn.close() before new connection
+
+═══════════════════════════════════════════════════════════════════════════════
+
+CRASH SCENARIOS TESTED:
+
+✗ F12 viewport mode toggle → sync.py:56 AttributeError
+✗ Minimize viewport → engine.py:196 GPU texture error
+✗ Connect, timeout, reconnect → connection.py double-thread
+✗ Network packet loss → frame.py JPEG corruption hang
+✗ Expand/collapse sidebar → engine.py:204 AttributeError
+✗ Server sends wrong resolution → engine.py:96 reshape error
+✗ CLI render (`blender -b scene.blend`) → engine.py:59 AttributeError
+✗ Temp directory full → sync.py:31 uncaught OSError
+✗ Open Render Properties (addon disabled) → preferences.py:67 KeyError
+✗ Server returns vram_total=0 → preferences.py:97 ZeroDivisionError
+✗ Multiple concurrent renders → engine.py:28 race condition
+
+═══════════════════════════════════════════════════════════════════════════════
+
+RECOMMENDATION:
+
+Priority 1 (BLOCKER — Fix before ANY beta):
+  - Issues #1, #2, #3, #4, #6, #7, #9, #10
+  
+Priority 2 (Before beta release):
+  - Issues #5, #8, #11, #12, #13, #14, #15, #17, #18
+
+Priority 3 (Polish/hardening):
+  - Issues #16, #19, #20, #21, #22, #23, #24, #25-30
+
+Full audit report with code examples: ADDON_AUDIT_REPORT.md

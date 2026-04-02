@@ -1,0 +1,156 @@
+======================================================================
+END-TO-END RENDER CYCLE SIMULATION REPORT
+======================================================================
+Timestamp: 2026-04-02T23:07:14.877328
+
+PHASE BREAKDOWN
+======================================================================
+======================================================================
+Phase: Phase 1: Client Setup
+Status: COMPLETE
+Duration: 52.1ms
+Data Sent: 100 bytes
+Data Received: 269 bytes
+Details:
+  blender_version: 4.1
+  addon_version: 1.0.0
+  engine_registered: REMOTE_CYCLES
+  server_ip: 127.0.0.1
+  server_port: 8765
+  connection_status: connected
+  server_capabilities: {'viewport_rendering': True, 'multi_viewport': True, 'pass_streaming': True, 'animation': True, 'gpu_backends': ['CPU', 'CUDA', 'OPTIX'], 'denoising': ['OPTIX', 'OIDN']}
+
+======================================================================
+Phase: Phase 2: Scene Sync
+Status: COMPLETE
+Duration: 256.3ms
+Data Sent: 50,000,000 bytes
+Data Received: 90 bytes
+Details:
+  object_count: 1
+  camera_present: Camera
+  serialization_time_ms: 133.53
+  scene_hash: c374cc42
+  objects_loaded: 5
+
+======================================================================
+Phase: Phase 3: Viewport Render
+Status: COMPLETE
+Duration: 16849.2ms
+Data Sent: 1,000 bytes
+Data Received: 10,368,275 bytes
+Frames Processed: 5
+Details:
+  view_matrix_extracted: True
+  frames_streamed: 5
+  avg_latency_ms: 3369.80
+  max_latency_ms: 3412.53
+
+======================================================================
+Phase: Phase 4: Frame Reception & Display
+Status: COMPLETE
+Duration: 33482.6ms
+Data Sent: 0 bytes
+Data Received: 20,736,550 bytes
+Frames Processed: 10
+Details:
+  buffer_capacity: 60
+  total_frames_received: 10
+  avg_decode_time_ms: 0.05
+  avg_upload_time_ms: 1.26
+
+======================================================================
+Phase: Phase 5: Pass Streaming
+Status: COMPLETE
+Duration: 20459.3ms
+Data Sent: 0 bytes
+Data Received: 12,441,930 bytes
+Frames Processed: 1
+Details:
+  tier_1_beauty_bytes: 2073655
+  tier_2_normal_bytes: 2073655
+  tier_2_depth_bytes: 2073655
+  tier_3_albedo_bytes: 2073655
+  passes_cached: 4
+  total_pass_data_mb: 11.87
+
+======================================================================
+Phase: Phase 6: Multi-Viewport Rendering
+Status: COMPLETE
+Duration: 3585.4ms
+Data Sent: 0 bytes
+Data Received: 2,592,110 bytes
+Frames Processed: 2
+Details:
+  viewport_1_resolution: 1920x1080
+  viewport_2_resolution: 1280x720
+  viewport_1_bytes: 2073655
+  viewport_2_bytes: 518455
+  total_bytes: 2592110
+
+======================================================================
+Phase: Phase 7: Animation Timeline
+Status: COMPLETE
+Duration: 24822.3ms
+Data Sent: 0 bytes
+Data Received: 14,515,585 bytes
+Frames Processed: 7
+Details:
+  frame_start: 1
+  frame_end: 240
+  fps: 24
+  frame_rendered: 10
+  frame_size_bytes: 2073655
+  frame_sequence_count: 6
+
+======================================================================
+Phase: Phase 8: OptiX Denoising
+Status: COMPLETE
+Duration: 1.5ms
+Data Sent: 0 bytes
+Data Received: 8,294,436 bytes
+Details:
+  requested_denoiser: OPTIX
+  denoiser_intensity: 0.80
+  denoiser_actually_used: OPTIX
+  denoised_exr_bytes: 8294436
+
+======================================================================
+Phase: Phase 9: GPU Backend Selection
+Status: COMPLETE
+Duration: 50.1ms
+Data Sent: 0 bytes
+Data Received: 0 bytes
+Details:
+  available_backends: ['CPU', 'CUDA', 'OPTIX']
+  cuda_switch_successful: True
+  cpu_switch_successful: True
+  invalid_backend_rejected: True
+
+======================================================================
+SUMMARY STATISTICS
+======================================================================
+Total Duration: 99559.0ms
+Total Data Sent: 50,001,100 bytes (47.7 MB)
+Total Data Received: 68,949,245 bytes (65.8 MB)
+
+FRAME LATENCIES
+======================================================================
+Frames Processed: 5
+Average Latency: 3369.8ms
+Min Latency: 3317.7ms
+Max Latency: 3412.5ms
+
+BANDWIDTH ANALYSIS
+======================================================================
+Phase 1: Client Setup: 0.0 MB/s
+Phase 2: Scene Sync: 186.1 MB/s
+Phase 3: Viewport Render: 0.6 MB/s
+Phase 4: Frame Reception & Display: 0.6 MB/s
+Phase 5: Pass Streaming: 0.6 MB/s
+Phase 6: Multi-Viewport Rendering: 0.7 MB/s
+Phase 7: Animation Timeline: 0.6 MB/s
+Phase 8: OptiX Denoising: 5322.9 MB/s
+Phase 9: GPU Backend Selection: 0.0 MB/s
+
+======================================================================
