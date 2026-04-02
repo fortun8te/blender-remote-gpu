@@ -95,28 +95,28 @@ class REMOTEGPU_PT_connection_panel(bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
+
+        # Try to get preferences safely
         try:
-            # Handle __package__ being None in certain Blender contexts
-            # When installed from ZIP, addon folder name is "addon"
             addon_name = __package__ if __package__ else "addon"
             addon = context.preferences.addons.get(addon_name)
-            if addon is None:
-                layout.label(text="Addon not found", icon="ERROR")
+            if not addon or not hasattr(addon, 'preferences') or addon.preferences is None:
+                layout.label(text="Please enable the addon in preferences first", icon="ERROR")
                 return
             prefs = addon.preferences
-            if prefs is None:
-                layout.label(text="Preferences not initialized", icon="ERROR")
-                return
         except Exception as e:
-            layout.label(text=f"Error: {str(e)[:50]}", icon="ERROR")
+            layout.label(text=f"Error loading preferences", icon="ERROR")
             return
 
         # Connection settings
         box = layout.box()
         box.label(text="Server Connection", icon="URL")
         row = box.row(align=True)
-        row.prop(prefs, "server_ip", text="IP")
-        row.prop(prefs, "server_port", text="Port")
+        try:
+            row.prop(prefs, "server_ip", text="IP")
+            row.prop(prefs, "server_port", text="Port")
+        except:
+            row.label(text="Preferences error - restart Blender")
 
         # Connect/disconnect button
         from . import engine
