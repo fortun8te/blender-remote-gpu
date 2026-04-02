@@ -4,7 +4,7 @@ Set these once, addon auto-connects on startup. No UI fiddling needed.
 """
 
 # Tailscale IPs (VPN-based, works anywhere)
-REMOTE_SERVER_IP = "100.74.135.83"  # Windows (degitaar) Tailscale IP
+REMOTE_SERVER_IP = "100.74.135.83"  # Windows RTX Tailscale IP
 REMOTE_SERVER_PORT = 9876
 USE_TAILSCALE = True
 
@@ -37,7 +37,7 @@ JPEG_QUALITY_ADAPTIVE = True  # Auto-scale quality based on network
 PREFERRED_GPU_BACKEND = "OPTIX"  # "OPTIX", "CUDA", "HIP", "VULKAN"
 
 # Security & Network
-USE_TLS = True
+USE_TLS = False  # Disabled for dev — Tailscale already encrypts traffic
 API_KEY = "sk-render-dev-2026"  # Change in production
 VERIFY_SERVER_CERT = False  # Set True in production with proper certs
 
