@@ -16,7 +16,7 @@ This test requires NO actual Blender or GPU hardware. It creates mock
 objects and measures the full pipeline latency and bandwidth.
 
 Run with:
-    python3 e2e_simulation.py [--verbose] [--save-report]
+    python scripts/e2e_simulation.py [--verbose] [--save-report]
 """
 
 import os
@@ -1149,7 +1149,9 @@ def main():
 
     # Save if requested
     if args.save_report:
-        report_path = Path("/Users/mk/Downloads/blender-remote-gpu/e2e_simulation_report.txt")
+        _root = Path(__file__).resolve().parent.parent
+        report_path = _root / "docs" / "archive" / "e2e_simulation_report.txt"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
         with open(report_path, "w") as f:
             f.write(report.get_summary())
         print(f"\nReport saved to: {report_path}")

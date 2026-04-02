@@ -58,12 +58,12 @@
 ```bash
 # Edit addon code
 # Then:
-python3 dev_reload.py
+python scripts/dev_reload.py
 ```
 
 Or auto-reload on every change:
 ```bash
-python3 dev_reload.py --watch
+python scripts/dev_reload.py --watch
 ```
 
 ---
@@ -75,7 +75,7 @@ python3 dev_reload.py --watch
 | Connection refused | Check Windows server running (`start_server.bat`) |
 | Auto-connect fails | Check IP is correct in `dev_config.py` |
 | GPU not found on Windows | Run `nvidia-smi` — check RTX 5090 visible |
-| Changes don't reload | Run `python3 dev_reload.py` or restart Blender |
+| Changes don't reload | Run `python scripts/dev_reload.py` or restart Blender |
 | Viewport shows nothing | Check Render Engine is set to "Remote Cycles" |
 
 ---

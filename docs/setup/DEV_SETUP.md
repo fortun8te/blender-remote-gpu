@@ -36,10 +36,10 @@ Or copy manually:
 
 ```bash
 # Edit addon code, then:
-python3 dev_reload.py
+python scripts/dev_reload.py
 
 # Or watch for changes automatically:
-python3 dev_reload.py --watch
+python scripts/dev_reload.py --watch
 ```
 
 Changes appear instantly in viewport. No Blender restart required.
@@ -52,7 +52,7 @@ DEFAULT_DENOISER = "OPTIX"     # Edit this
 VIEWPORT_FPS = 30              # Edit this
 ```
 
-Restart Blender or run `python3 dev_reload.py` to apply.
+Restart Blender or run `python scripts/dev_reload.py` to apply.
 
 ### Use Tailscale Instead of LAN (Optional)
 
@@ -75,7 +75,7 @@ Blender will auto-connect to the Tailscale IP instead.
 - Check firewall allows port 9876
 
 **Changes don't reload?**
-- Run `python3 dev_reload.py` manually
+- Run `python scripts/dev_reload.py` manually
 - Or restart Blender
 - Check console for errors: Window → Toggle System Console
 
@@ -89,7 +89,7 @@ Blender will auto-connect to the Tailscale IP instead.
 ## Development Workflow
 
 1. **Edit code** → changes auto-save
-2. **Run `python3 dev_reload.py`** → addon reloads in Blender
+2. **Run `python scripts/dev_reload.py`** → addon reloads in Blender
 3. **Test in viewport** → see changes instantly
 4. **Debug via console** → Window → Toggle System Console
 
