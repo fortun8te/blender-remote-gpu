@@ -153,7 +153,7 @@ class REMOTEGPU_PT_connection_panel(bpy.types.Panel):
 
         # Network mode
         box = layout.box()
-        box.label(text="Network", icon="NETWORK_BIND")
+        box.label(text="Network", icon="NETWORK_DRIVE")
         row = box.row()
         row.prop(prefs, "network_mode", expand=True)
 
@@ -173,7 +173,7 @@ class REMOTEGPU_PT_connection_panel(bpy.types.Panel):
 
         # Denoising & GPU Backend
         box = layout.box()
-        box.label(text="GPU Backend", icon="GPU")
+        box.label(text="GPU Backend", icon="SHADING_SOLID")
         col = box.column()
         col.prop(prefs, "denoiser_type", expand=False)
 
@@ -200,14 +200,14 @@ class REMOTEGPU_PT_connection_panel(bpy.types.Panel):
                 gpu_name = status["gpu_name"]
                 col = box.column()
                 col.separator()
-                col.label(text=f"Server GPU: {gpu_name}", icon="GPU")
+                col.label(text=f"Server GPU: {gpu_name}", icon="INFO")
                 if "gpu_memory" in status:
                     col.label(text=f"VRAM: {status['gpu_memory']}GB")
 
             # GPU backend selection (NVRHI-style multi-backend support)
             if "available_backends" in status:
                 backends_box = layout.box()
-                backends_box.label(text="GPU Backends", icon="DRIVER")
+                backends_box.label(text="GPU Backends", icon="PREFERENCES")
                 available = status.get("available_backends", [])
                 current = status.get("current_backend", "NONE")
 
