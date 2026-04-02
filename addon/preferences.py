@@ -5,8 +5,8 @@ from bpy.props import StringProperty, IntProperty, IntVectorProperty, EnumProper
 
 
 class RemoteGPUPreferences(bpy.types.AddonPreferences):
-    # Issue #9: Explicit bl_idname to avoid __package__ None error in some contexts
-    bl_idname = "blender_remote_gpu"
+    # bl_idname MUST match the actual addon folder name ("addon" when installed from ZIP)
+    bl_idname = "addon"
 
     server_ip: StringProperty(
         name="Server IP",
@@ -97,12 +97,16 @@ class REMOTEGPU_PT_connection_panel(bpy.types.Panel):
         layout = self.layout
         try:
             # Handle __package__ being None in certain Blender contexts
-            addon_name = __package__ if __package__ else "blender_remote_gpu"
+            # When installed from ZIP, addon folder name is "addon"
+            addon_name = __package__ if __package__ else "addon"
             addon = context.preferences.addons.get(addon_name)
             if addon is None:
                 layout.label(text="Addon not found", icon="ERROR")
                 return
             prefs = addon.preferences
+            if prefs is None:
+                layout.label(text="Preferences not initialized", icon="ERROR")
+                return
         except Exception as e:
             layout.label(text=f"Error: {str(e)[:50]}", icon="ERROR")
             return

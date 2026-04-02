@@ -50,8 +50,8 @@ def register():
 
         print(f"[RemoteGPU] Auto-connecting to {ip}:{port} (TLS={'on' if use_tls else 'off'})")
         try:
-            # Set preferences from dev_config
-            addon_name = __name__ if __name__ else "blender_remote_gpu"
+            # Set preferences from dev_config (addon folder name is "addon" when installed from ZIP)
+            addon_name = __name__ if __name__ else "addon"
             prefs = bpy.context.preferences.addons[addon_name].preferences
             prefs.server_ip = ip
             prefs.server_port = port
