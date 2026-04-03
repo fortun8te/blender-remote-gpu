@@ -40,6 +40,7 @@ import base64
 import tempfile
 import time
 import threading
+import shutil
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 WORKER_PORT = int(os.environ.get("WORKER_PORT", "9880"))
@@ -165,15 +166,16 @@ def render_frame(width, height, samples=1, quality=75):
     scene.render.image_settings.file_format = "JPEG"
     scene.render.image_settings.quality     = quality
 
-    output_dir  = tempfile.mkdtemp(prefix="wrkr_")
-    output_path = os.path.join(output_dir, "frame.jpg")
-    scene.render.filepath = output_path
-
-    start     = time.time()
+    output_dir  = None
+    output_path = None
+    start       = time.time()
     # ATOMIC: Set _rendering under lock
     with _state_lock:
         _rendering = True
     try:
+        output_dir  = tempfile.mkdtemp(prefix="wrkr_")
+        output_path = os.path.join(output_dir, "frame.jpg")
+        scene.render.filepath = output_path
         bpy.ops.render.render(write_still=True)
         if os.path.isfile(output_path):
             with open(output_path, "rb") as f:
@@ -192,11 +194,12 @@ def render_frame(width, height, samples=1, quality=75):
         # ATOMIC: Clear _rendering under lock
         with _state_lock:
             _rendering = False
-        try:
-            os.remove(output_path)
-            os.rmdir(output_dir)
-        except Exception:
-            pass
+        # Guaranteed cleanup of temp directory
+        if output_dir and os.path.exists(output_dir):
+            try:
+                shutil.rmtree(output_dir)
+            except Exception as cleanup_err:
+                _log(f"Could not clean {output_dir}: {cleanup_err}")
 
 
 # ── HTTP handler (daemon thread — NO bpy.ops here) ───────────
@@ -254,13 +257,26 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 if not blend_b64:
                     response = {"type": "error", "message": "No blend_data"}
                 else:
-                    tmp = tempfile.NamedTemporaryFile(suffix=".blend", delete=False)
-                    tmp.write(base64.b64decode(blend_b64))
-                    tmp.close()
-                    with _pending_lock:
-                        _pending_path = tmp.name
-                    _log(f"Queued scene load (from b64): {tmp.name}")
-                    response = {"type": "scene_loading"}
+                    tmp_file = None
+                    try:
+                        tmp_file = tempfile.NamedTemporaryFile(suffix=".blend", delete=False)
+                        tmp_file.write(base64.b64decode(blend_b64))
+                        tmp_file.close()
+                        with _pending_lock:
+                            _pending_path = tmp_file.name
+                        _log(f"Queued scene load (from b64): {tmp_file.name}")
+                        response = {"type": "scene_loading"}
+                    except Exception as e:
+                        _log(f"Error writing temp scene file: {e}")
+                        response = {"type": "error", "message": "Failed to load scene data"}
+                    finally:
+                        # Cleanup temp file if exception occurs before _pending_path is set
+                        if tmp_file and tmp_file.name:
+                            if tmp_file not in [_pending_path] and os.path.exists(tmp_file.name):
+                                try:
+                                    os.remove(tmp_file.name)
+                                except Exception as cleanup_err:
+                                    _log(f"Could not clean {tmp_file.name}: {cleanup_err}")
 
             elif msg_type == "update_camera":
                 view_matrix = data.get("view_matrix")
@@ -316,35 +332,45 @@ class WorkerHandler(BaseHTTPRequestHandler):
                     width   = data.get("width", 1920)
                     height  = data.get("height", 1080)
                     samples = data.get("samples", 128)
-                    with _render_lock:
-                        scene = bpy.context.scene
-                        scene.render.resolution_x         = width
-                        scene.render.resolution_y         = height
-                        scene.render.resolution_percentage = 100
-                        scene.cycles.samples               = samples
-                        _enable_denoiser(scene)
-                        scene.render.image_settings.file_format = "PNG"
-                        output_dir  = tempfile.mkdtemp(prefix="final_")
-                        output_path = os.path.join(output_dir, "final.png")
-                        scene.render.filepath = output_path
-                        start = time.time()
-                        bpy.ops.render.render(write_still=True)
-                        elapsed_ms = int((time.time() - start) * 1000)
-                        if os.path.isfile(output_path):
-                            with open(output_path, "rb") as f:
-                                png_data = f.read()
-                            _log(f"Final {width}x{height}@{samples}spp {elapsed_ms}ms {len(png_data)//1024}KB")
-                            response = {
-                                "type":       "render_result",
-                                "png_b64":    base64.b64encode(png_data).decode("ascii"),
-                                "width":      width,
-                                "height":     height,
-                                "elapsed_ms": elapsed_ms,
-                            }
-                            os.remove(output_path)
-                        else:
-                            response = {"type": "error", "message": "No output produced"}
-                        os.rmdir(output_dir)
+                    output_dir = None
+                    try:
+                        with _render_lock:
+                            scene = bpy.context.scene
+                            scene.render.resolution_x         = width
+                            scene.render.resolution_y         = height
+                            scene.render.resolution_percentage = 100
+                            scene.cycles.samples               = samples
+                            _enable_denoiser(scene)
+                            scene.render.image_settings.file_format = "PNG"
+                            output_dir  = tempfile.mkdtemp(prefix="final_")
+                            output_path = os.path.join(output_dir, "final.png")
+                            scene.render.filepath = output_path
+                            start = time.time()
+                            bpy.ops.render.render(write_still=True)
+                            elapsed_ms = int((time.time() - start) * 1000)
+                            if os.path.isfile(output_path):
+                                with open(output_path, "rb") as f:
+                                    png_data = f.read()
+                                _log(f"Final {width}x{height}@{samples}spp {elapsed_ms}ms {len(png_data)//1024}KB")
+                                response = {
+                                    "type":       "render_result",
+                                    "png_b64":    base64.b64encode(png_data).decode("ascii"),
+                                    "width":      width,
+                                    "height":     height,
+                                    "elapsed_ms": elapsed_ms,
+                                }
+                            else:
+                                response = {"type": "error", "message": "No output produced"}
+                    except Exception as e:
+                        _log(f"Render final error: {e}")
+                        response = {"type": "error", "message": str(e)}
+                    finally:
+                        # Guaranteed cleanup of temp directory
+                        if output_dir and os.path.exists(output_dir):
+                            try:
+                                shutil.rmtree(output_dir)
+                            except Exception as cleanup_err:
+                                _log(f"Could not clean {output_dir}: {cleanup_err}")
             else:
                 response = {"type": "error", "message": f"Unknown: {msg_type}"}
 
