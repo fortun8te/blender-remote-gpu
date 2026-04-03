@@ -84,8 +84,8 @@ class REMOTEGPU_OT_auto_discover(bpy.types.Operator):
 
 class REMOTEGPU_OT_connect(bpy.types.Operator):
     bl_idname = "remotegpu.connect"
-    bl_label = "Connect to Dispatcher"
-    bl_description = "Connect to the job dispatcher"
+    bl_label = "Connect to USB"
+    bl_description = "Connect to the Windows render server via Thunderbolt USB"
 
     _timer = None
     _thread = None
@@ -98,20 +98,19 @@ class REMOTEGPU_OT_connect(bpy.types.Operator):
             print(f"[RemoteGPU] ERROR: preferences not found. __package__={__package__}")
             return {"CANCELLED"}
 
-        # Clear old dispatcher
+        # Clear old client
         engine.RemoteRenderEngine._dispatcher = None
 
-        ip = prefs.server_ip
-        port = prefs.server_port
-        self.report({"INFO"}, f"Connecting to dispatcher {ip}:{port}...")
+        self.report({"INFO"}, "Connecting to Windows render server via Thunderbolt USB...")
 
-        # Test connection in background thread
-        from .connection import JobDispatcherClient
-        dispatcher = JobDispatcherClient(ip, port)
+        # Test connection in background thread using USB client
+        from .connection import USBClient
+        usb_client = USBClient()
 
         def _test_ping():
-            result = dispatcher.ping()
-            REMOTEGPU_OT_connect._result = (result, dispatcher)
+            usb_client.connect()
+            result = usb_client.ping() if usb_client.connected else False
+            REMOTEGPU_OT_connect._result = (result, usb_client)
 
         REMOTEGPU_OT_connect._result = None
         REMOTEGPU_OT_connect._thread = threading.Thread(target=_test_ping, daemon=True)
@@ -135,13 +134,13 @@ class REMOTEGPU_OT_connect(bpy.types.Operator):
 
         result = REMOTEGPU_OT_connect._result
         if result and result[0]:
-            dispatcher = result[1]
-            engine.RemoteRenderEngine._dispatcher = dispatcher
-            self.report({"INFO"}, f"Connected to dispatcher ({dispatcher.latency_ms}ms)")
+            usb_client = result[1]
+            engine.RemoteRenderEngine._dispatcher = usb_client
+            self.report({"INFO"}, f"Connected to Windows via Thunderbolt USB ({usb_client.latency_ms}ms)")
         else:
-            dispatcher = result[1] if result else None
-            error = dispatcher.error if dispatcher else "Unknown error"
-            self.report({"ERROR"}, f"Dispatcher unreachable: {error}")
+            usb_client = result[1] if result else None
+            error = usb_client.error if usb_client else "Unknown error"
+            self.report({"ERROR"}, f"Windows server unreachable: {error}")
 
         # Redraw UI
         for area in context.screen.areas:
@@ -175,30 +174,23 @@ class REMOTEGPU_OT_disconnect(bpy.types.Operator):
 
 class REMOTEGPU_OT_test_connection(bpy.types.Operator):
     bl_idname = "remotegpu.test_connection"
-    bl_label = "Test Dispatcher"
-    bl_description = "Test if the dispatcher is reachable"
+    bl_label = "Test USB"
+    bl_description = "Test if the Windows server is reachable via Thunderbolt USB"
 
     _timer = None
     _thread = None
     _result = None
 
     def execute(self, context):
-        prefs = _get_prefs(context)
-        if not prefs:
-            self.report({"ERROR"}, "Addon preferences not found — check addon is enabled")
-            print(f"[RemoteGPU] ERROR: preferences not found. __package__={__package__}")
-            return {"CANCELLED"}
+        self.report({"INFO"}, "Testing Windows render server via Thunderbolt USB...")
 
-        ip = prefs.server_ip
-        port = prefs.server_port
-        self.report({"INFO"}, f"Testing dispatcher {ip}:{port}...")
-
-        from .connection import JobDispatcherClient
-        dispatcher = JobDispatcherClient(ip, port)
+        from .connection import USBClient
+        usb_client = USBClient()
 
         def _test():
-            result = dispatcher.ping()
-            REMOTEGPU_OT_test_connection._result = (result, dispatcher)
+            usb_client.connect()
+            result = usb_client.ping() if usb_client.connected else False
+            REMOTEGPU_OT_test_connection._result = (result, usb_client)
 
         REMOTEGPU_OT_test_connection._result = None
         REMOTEGPU_OT_test_connection._thread = threading.Thread(target=_test, daemon=True)
@@ -220,12 +212,12 @@ class REMOTEGPU_OT_test_connection(bpy.types.Operator):
 
         result = REMOTEGPU_OT_test_connection._result
         if result and result[0]:
-            dispatcher = result[1]
-            self.report({"INFO"}, f"Dispatcher reachable ({dispatcher.latency_ms}ms)")
+            usb_client = result[1]
+            self.report({"INFO"}, f"Windows server reachable via USB ({usb_client.latency_ms}ms)")
         else:
-            dispatcher = result[1] if result else None
-            error = dispatcher.error if dispatcher else "Unknown error"
-            self.report({"ERROR"}, f"Cannot reach dispatcher: {error}")
+            usb_client = result[1] if result else None
+            error = usb_client.error if usb_client else "Unknown error"
+            self.report({"ERROR"}, f"Cannot reach Windows server: {error}")
 
         for area in context.screen.areas:
             area.tag_redraw()

@@ -1,13 +1,16 @@
-"""HTTP clients for remote render systems.
+"""USB and HTTP clients for remote render systems.
 
 LEGACY: Connection class (persistent worker) — deprecated in favor of JobDispatcherClient
-NEW: JobDispatcherClient — stateless job dispatcher API (Agent R3)
+NEW: JobDispatcherClient — stateless job dispatcher API (HTTP, Agent R3)
+CURRENT: USBClient — USB bulk transfers over Thunderbolt (Agent USB2)
 
-Connection methods tried in order (all Python builtins, zero external deps):
+Connection methods tried in order (all Python builtins, zero external deps for HTTP):
 1. urllib.request (HTTP POST)
 2. http.client (lower-level HTTP)
 3. Raw TCP socket (length-prefixed JSON)
 4. xmlrpc.client (XML-RPC over HTTP)
+
+USB client uses pyusb for Thunderbolt USB bridge (zero network code).
 """
 
 import json
@@ -15,6 +18,12 @@ import time
 import base64
 import urllib.request
 import urllib.error
+
+# Import USB client (will be used by operators.py)
+try:
+    from .usb_client import USBClient
+except ImportError:
+    USBClient = None
 
 
 class Connection:

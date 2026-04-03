@@ -1,9 +1,10 @@
 """Remote GPU render engine — F12 renders on the remote RTX GPU.
 
-AGENT R3: Migrated to stateless job dispatcher API.
-  Mac saves .blend → dispatcher queues job → RTX 5080 renders → PNG back
+AGENT USB2: USB bulk transfers over Thunderbolt (replacing HTTP JobDispatcherClient).
+  Mac saves .blend → USB command queues job → RTX 5080 renders → PNG back via USB
 
-Previously: persistent worker connection (now replaced by dispatcher)
+Previously: HTTP-based JobDispatcherClient (Agent R3)
+Original: persistent worker connection
 """
 
 import bpy
