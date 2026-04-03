@@ -39,7 +39,8 @@ ZIP_NAME="blender_remote_gpu_addon_${NEW_BUILD}.zip"
 echo "📦 Creating: $ZIP_NAME"
 
 # Zip only the addon folder (not server/ or shared/)
-zip -r "$ZIP_NAME" addon/ -x "addon/__pycache__/*" "addon/*.pyc" "addon/modules/*" > /dev/null 2>&1
+# Include modules/ so websockets is bundled with the addon
+zip -r "$ZIP_NAME" addon/ -x "addon/__pycache__/*" "addon/*.pyc" "addon/modules/__pycache__/*" > /dev/null 2>&1
 
 # Verify
 if [ -f "$ZIP_NAME" ]; then
