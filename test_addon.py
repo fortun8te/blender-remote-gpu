@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Diagnostic test suite for Blender Remote GPU addon.
+Diagnostic test suite for Blender Remote GPU remote_gpu_render.
 
-Run without Blender:  python3 test_addon.py
-Run with Blender:     blender --background --python test_addon.py
+Run without Blender:  python3 test_remote_gpu_render.py
+Run with Blender:     blender --background --python test_remote_gpu_render.py
 
 Tests all 4 connection methods and server connectivity.
 """
@@ -13,7 +13,7 @@ import sys
 import time
 import os
 
-# Add addon to path for testing
+# Add remote_gpu_render to path for testing
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # Default server settings
@@ -122,7 +122,7 @@ def test_connection_cascade():
         import importlib.util
         spec = importlib.util.spec_from_file_location(
             "connection",
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "addon", "connection.py"),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "remote_gpu_render", "connection.py"),
         )
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
@@ -156,24 +156,24 @@ def test_blender():
 
     def _register():
         import bpy
-        # Enable the addon
-        bpy.ops.preferences.addon_enable(module="addon")
-        assert "addon" in bpy.context.preferences.addons or \
-               any("remote" in k.lower() for k in bpy.context.preferences.addons.keys()), \
+        # Enable the remote_gpu_render
+        bpy.ops.preferences.remote_gpu_render_enable(module="remote_gpu_render")
+        assert "remote_gpu_render" in bpy.context.preferences.remote_gpu_renders or \
+               any("remote" in k.lower() for k in bpy.context.preferences.remote_gpu_renders.keys()), \
                "Addon not found in preferences"
 
     test("Addon registration", _register)
 
     def _prefs():
         import bpy
-        # Find the addon preferences
+        # Find the remote_gpu_render preferences
         found = False
-        for name, addon in bpy.context.preferences.addons.items():
-            if hasattr(addon, "preferences") and hasattr(addon.preferences, "server_ip"):
+        for name, remote_gpu_render in bpy.context.preferences.remote_gpu_renders.items():
+            if hasattr(remote_gpu_render, "preferences") and hasattr(remote_gpu_render.preferences, "server_ip"):
                 found = True
                 print(f"         Addon name: '{name}'")
-                print(f"         Server IP: {addon.preferences.server_ip}")
-                print(f"         Server Port: {addon.preferences.server_port}")
+                print(f"         Server IP: {remote_gpu_render.preferences.server_ip}")
+                print(f"         Server Port: {remote_gpu_render.preferences.server_port}")
                 break
         assert found, "Addon preferences with server_ip not found"
 
