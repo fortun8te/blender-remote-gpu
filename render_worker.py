@@ -1,38 +1,35 @@
 #!/usr/bin/env python3
 """
-Persistent Blender Render Worker b32 — runs INSIDE Blender, keeps scene in GPU memory.
+Persistent Blender Render Worker b33 — runs INSIDE Blender, keeps scene in GPU memory.
 
 Launch: blender --background --python render_worker.py
 
-b32: open_mainfile runs directly in the main loop (not via bpy.app.timers,
-     which don't fire in --background mode). HTTP handler sets a pending path,
-     main loop picks it up and calls open_mainfile on the main thread.
+KEY INSIGHT (b33): The script must RETURN (not block in a while loop) so Blender
+enters WM_main() — its internal event loop that pumps bpy.app.timers.
+A `while True: time.sleep()` loop blocks the main thread forever and prevents
+timers from firing. Instead we register a persistent timer and let the script end.
 """
 
 import bpy
 import json
 import base64
 import os
-import sys
 import tempfile
 import time
 import threading
+import queue
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 WORKER_PORT = int(os.environ.get("WORKER_PORT", "9880"))
 
 _scene_loaded   = False
-_scene_path     = ""
 _scene_loading  = False
-_last_render_b64 = ""
 _rendering      = False
 _render_lock    = threading.Lock()
+_compute_type   = "NONE"
 
-# Pending blend file path — set by HTTP thread, consumed by main loop
-_pending_load_path = None
-_pending_load_lock = threading.Lock()
-
-_compute_type = "NONE"
+# Queue for scene load requests — HTTP thread puts, main-thread timer gets
+_load_queue = queue.Queue()
 
 
 # ── GPU setup ─────────────────────────────────────────────────
@@ -71,26 +68,39 @@ def _enable_denoiser(scene):
         pass
 
 
-# ── Scene loading (called from main loop, NOT from HTTP thread) ──
+# ── Main-thread timer (fires via Blender's WM_main event loop) ──
 
-def _do_load_scene(path):
-    """Open a .blend file. MUST be called from the main thread."""
-    global _scene_loaded, _scene_path, _scene_loading
+def _main_thread_tick():
+    """Called by Blender's event loop every 0.2s on the MAIN thread.
+    Safe to call any bpy.ops here. persistent=True keeps it alive across file loads.
+    """
+    global _scene_loaded, _scene_loading
+
+    try:
+        task = _load_queue.get_nowait()
+    except queue.Empty:
+        return 0.2  # Check again in 0.2s
+
+    path = task.get("path", "")
+    if not path or not os.path.isfile(path):
+        print(f"[Worker] Load skipped — file not found: {path}")
+        return 0.2
 
     _scene_loading = True
     _scene_loaded  = False
-    print(f"[Worker] Loading scene from disk: {path}")
+    print(f"[Worker] Main thread loading: {path}")
 
     try:
         bpy.ops.wm.open_mainfile(filepath=path)
         setup_gpu()
-        _scene_path   = path
         _scene_loaded = True
         print(f"[Worker] Scene ready: {len(bpy.data.objects)} objects, compute={_compute_type}")
     except Exception as e:
         print(f"[Worker] open_mainfile failed: {e}")
     finally:
         _scene_loading = False
+
+    return 0.2  # Keep ticking
 
 
 # ── Camera helper ─────────────────────────────────────────────
@@ -115,7 +125,7 @@ def set_camera_from_matrix(view_matrix_flat):
 # ── Render ────────────────────────────────────────────────────
 
 def render_frame(width, height, samples=1, quality=75):
-    global _last_render_b64, _rendering
+    global _rendering
 
     scene = bpy.context.scene
     scene.render.resolution_x         = width
@@ -138,10 +148,10 @@ def render_frame(width, height, samples=1, quality=75):
             with open(output_path, "rb") as f:
                 jpg_data = f.read()
             elapsed_ms = int((time.time() - start) * 1000)
-            _last_render_b64 = base64.b64encode(jpg_data).decode("ascii")
+            result_b64 = base64.b64encode(jpg_data).decode("ascii")
             denoiser = getattr(scene.cycles, "denoiser", "?")
             print(f"[Worker] {width}x{height} @{samples}spp+{denoiser} {elapsed_ms}ms {len(jpg_data)//1024}KB")
-            return _last_render_b64
+            return result_b64
         print("[Worker] Render produced no output")
         return ""
     except Exception as e:
@@ -156,7 +166,7 @@ def render_frame(width, height, samples=1, quality=75):
             pass
 
 
-# ── HTTP handler ──────────────────────────────────────────────
+# ── HTTP handler (runs on daemon thread — NO bpy.ops calls here) ──
 
 class WorkerHandler(BaseHTTPRequestHandler):
     def do_POST(self):
@@ -171,7 +181,7 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 response = {
                     "type":          "pong",
                     "worker":        True,
-                    "build":         "b32",
+                    "build":         "b33",
                     "scene_loaded":  _scene_loaded,
                     "scene_loading": _scene_loading,
                     "rendering":     _rendering,
@@ -183,14 +193,11 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 if not blend_path or not os.path.isfile(blend_path):
                     response = {"type": "error", "message": f"File not found: {blend_path}"}
                 else:
-                    # Queue for main loop — do NOT call open_mainfile here
-                    global _pending_load_path
-                    with _pending_load_lock:
-                        _pending_load_path = blend_path
+                    _load_queue.put({"path": blend_path})
                     response = {"type": "scene_loading"}
 
             elif msg_type == "load_scene":
-                # Legacy: base64 in body — save to temp file then queue
+                # Legacy: base64 in body
                 blend_b64 = data.get("blend_data", "")
                 if not blend_b64:
                     response = {"type": "error", "message": "No blend_data"}
@@ -198,8 +205,7 @@ class WorkerHandler(BaseHTTPRequestHandler):
                     tmp = tempfile.NamedTemporaryFile(suffix=".blend", delete=False)
                     tmp.write(base64.b64decode(blend_b64))
                     tmp.close()
-                    with _pending_load_lock:
-                        _pending_load_path = tmp.name
+                    _load_queue.put({"path": tmp.name})
                     response = {"type": "scene_loading"}
 
             elif msg_type == "update_camera":
@@ -298,53 +304,37 @@ class WorkerHandler(BaseHTTPRequestHandler):
         pass
 
 
-# ── Main ──────────────────────────────────────────────────────
+# ── Startup ───────────────────────────────────────────────────
+#
+# CRITICAL: This script must RETURN (not block) so Blender enters WM_main(),
+# its internal event loop that pumps bpy.app.timers. A `while True: sleep()`
+# loop blocks the main thread forever and timers NEVER fire.
+#
+# Flow:
+#   1. Script runs: setup GPU, start HTTP server on daemon thread, register timer
+#   2. Script returns → Blender enters WM_main()
+#   3. WM_main pumps events → _main_thread_tick() fires every 0.2s
+#   4. Timer checks _load_queue, calls open_mainfile on main thread
+#   5. HTTP daemon thread handles pings/renders in parallel
 
-def main():
-    global _pending_load_path
+setup_gpu()
 
-    setup_gpu()
+print("=" * 55)
+print(f"[Worker] Blender Render Worker b33 on port {WORKER_PORT}")
+print(f"[Worker] Blender {bpy.app.version_string}")
+print(f"[Worker] Compute: {_compute_type}")
+print(f"[Worker] Script returns → WM_main() pumps timers")
+print("=" * 55)
 
-    print("=" * 55)
-    print(f"[Worker] Blender Render Worker b32 on port {WORKER_PORT}")
-    print(f"[Worker] Blender {bpy.app.version_string}")
-    print(f"[Worker] Compute: {_compute_type}")
-    print("=" * 55)
+# Start HTTP server on daemon thread
+_server = HTTPServer(("0.0.0.0", WORKER_PORT), WorkerHandler)
+_http_thread = threading.Thread(target=_server.serve_forever, daemon=True)
+_http_thread.start()
+print(f"[Worker] HTTP on port {WORKER_PORT}")
 
-    def _start_http():
-        """Start (or restart) the HTTP server on a daemon thread."""
-        srv = HTTPServer(("0.0.0.0", WORKER_PORT), WorkerHandler)
-        t = threading.Thread(target=srv.serve_forever, daemon=True)
-        t.start()
-        print(f"[Worker] HTTP on port {WORKER_PORT} — ready")
-        return srv, t
+# Register persistent timer — survives file loads, runs on main thread
+bpy.app.timers.register(_main_thread_tick, first_interval=0.2, persistent=True)
+print("[Worker] Timer registered (persistent=True) — returning to WM_main()")
 
-    server, http_thread = _start_http()
-
-    try:
-        while True:
-            # ── Check for pending scene load ──
-            with _pending_load_lock:
-                path = _pending_load_path
-                _pending_load_path = None
-
-            if path:
-                _do_load_scene(path)
-                # Restart HTTP server if open_mainfile killed the daemon thread
-                if not http_thread.is_alive():
-                    print("[Worker] HTTP thread died after open_mainfile — restarting")
-                    try:
-                        server.shutdown()
-                    except Exception:
-                        pass
-                    server, http_thread = _start_http()
-
-            time.sleep(0.1)
-
-    except KeyboardInterrupt:
-        print("[Worker] Shutting down")
-        server.shutdown()
-
-
-if __name__ == "__main__":
-    main()
+# DO NOT add while True or main() here — the script must end so Blender's
+# event loop takes over and pumps our timer.
