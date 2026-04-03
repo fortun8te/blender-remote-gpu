@@ -137,7 +137,13 @@ class Connection:
 
     def _worker(self):
         """Background thread: connect, send/receive, auto-reconnect."""
-        connect_fn = _get_ws()
+        try:
+            connect_fn = _get_ws()
+        except ImportError as e:
+            self.error = f"websockets module not found: {e}"
+            print(f"[Connection] CRITICAL: {self.error}")
+            print(f"[Connection] Check that addon/modules/websockets/ is present")
+            return
 
         while not self._stop.is_set():
             try:
