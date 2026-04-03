@@ -22,6 +22,8 @@ import sys
 import os
 import traceback
 from collections import deque
+import signal
+import platform
 
 # Try to import psutil for memory tracking (optional)
 try:
@@ -42,6 +44,12 @@ import time
 import threading
 import shutil
 from http.server import HTTPServer, BaseHTTPRequestHandler
+
+# Timeout constants (in seconds)
+_TIMEOUT_LOAD_FILE = 60      # Max 60s for open_mainfile
+_TIMEOUT_SETUP_GPU = 15      # Max 15s for GPU detection
+_TIMEOUT_RENDER = 300        # Max 300s (5 min) for render.render()
+_IS_WINDOWS = platform.system() == "Windows"
 
 WORKER_PORT = int(os.environ.get("WORKER_PORT", "9880"))
 
@@ -85,6 +93,80 @@ def _debug(msg):
         _log(f"[DEBUG] {msg}")
 
 
+# ── Timeout Handler ───────────────────────────────────────────
+
+def _timeout_handler(signum, frame):
+    """Signal handler for timeout (Unix/Linux only)"""
+    raise TimeoutError("Operation exceeded timeout")
+
+
+def run_with_timeout(func, timeout_sec, operation_name):
+    """
+    Execute func with a timeout.
+    - Unix/Linux: Uses signal.alarm() (cannot timeout blocking Blender ops reliably)
+    - Windows: Uses threading.Timer with best-effort cleanup
+
+    Args:
+        func: Callable to execute
+        timeout_sec: Timeout in seconds
+        operation_name: Human-readable name for logging
+
+    Returns:
+        Result of func() if successful
+
+    Raises:
+        TimeoutError: If operation exceeds timeout_sec
+    """
+    _log(f"[TIMEOUT] Starting '{operation_name}' with {timeout_sec}s timeout")
+
+    if _IS_WINDOWS:
+        # Windows: Use threading.Timer (signal.alarm not available on Windows)
+        result = [None]
+        exception = [None]
+        timer = [None]
+
+        def wrapper():
+            try:
+                result[0] = func()
+            except Exception as e:
+                exception[0] = e
+
+        def on_timeout():
+            _log(f"[TIMEOUT] '{operation_name}' exceeded {timeout_sec}s timeout on Windows")
+            exception[0] = TimeoutError(f"'{operation_name}' exceeded {timeout_sec}s")
+
+        thread = threading.Thread(target=wrapper, daemon=True)
+        thread.start()
+        timer[0] = threading.Timer(timeout_sec, on_timeout)
+        timer[0].daemon = True
+        timer[0].start()
+
+        thread.join(timeout=timeout_sec + 1)  # Wait thread + 1s buffer
+
+        if timer[0].is_alive():
+            timer[0].cancel()
+
+        if exception[0]:
+            raise exception[0]
+        return result[0]
+
+    else:
+        # Unix/Linux: Use signal.alarm()
+        old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+        signal.alarm(timeout_sec)
+        try:
+            result = func()
+            signal.alarm(0)  # Cancel alarm
+            _log(f"[TIMEOUT_OK] '{operation_name}' completed within {timeout_sec}s")
+            return result
+        except TimeoutError as e:
+            _log(f"[TIMEOUT] '{operation_name}' exceeded {timeout_sec}s: {e}")
+            raise
+        finally:
+            signal.alarm(0)  # Ensure alarm is cancelled
+            signal.signal(signal.SIGALRM, old_handler)
+
+
 def _should_retry_now(last_retry_time, attempt):
     """
     Check if enough time has passed for the next retry attempt.
@@ -99,7 +181,8 @@ def _should_retry_now(last_retry_time, attempt):
 
 # ── GPU setup ─────────────────────────────────────────────────
 
-def setup_gpu():
+def _setup_gpu_impl():
+    """Internal GPU setup implementation (to be wrapped with timeout)"""
     global _compute_type
     try:
         prefs = bpy.context.preferences
@@ -123,6 +206,19 @@ def setup_gpu():
         bpy.context.scene.cycles.device = "GPU"
     except Exception as e:
         _log(f"GPU setup warning: {e}")
+
+
+def setup_gpu():
+    """Setup GPU with timeout protection"""
+    try:
+        run_with_timeout(_setup_gpu_impl, _TIMEOUT_SETUP_GPU, "setup_gpu")
+    except TimeoutError as e:
+        _log(f"[TIMEOUT_ERROR] setup_gpu failed: {e}")
+        _log(f"[FALLBACK] Falling back to CPU rendering")
+        global _compute_type
+        _compute_type = "CPU"
+    except Exception as e:
+        _log(f"setup_gpu error: {e}")
 
 
 def _enable_denoiser(scene):
@@ -154,6 +250,12 @@ def set_camera_from_matrix(view_matrix_flat):
 
 # ── Render ────────────────────────────────────────────────────
 
+def _render_frame_impl(scene, output_path):
+    """Internal render implementation (to be wrapped with timeout)"""
+    bpy.ops.render.render(write_still=True)
+    return os.path.isfile(output_path)
+
+
 def render_frame(width, height, samples=1, quality=75):
     global _rendering
 
@@ -176,8 +278,19 @@ def render_frame(width, height, samples=1, quality=75):
         output_dir  = tempfile.mkdtemp(prefix="wrkr_")
         output_path = os.path.join(output_dir, "frame.jpg")
         scene.render.filepath = output_path
-        bpy.ops.render.render(write_still=True)
-        if os.path.isfile(output_path):
+
+        # Run render with timeout protection
+        try:
+            render_ok = run_with_timeout(
+                lambda: _render_frame_impl(scene, output_path),
+                _TIMEOUT_RENDER,
+                f"render_frame({width}x{height}@{samples}spp)"
+            )
+        except TimeoutError as e:
+            _log(f"[TIMEOUT_ERROR] Render operation exceeded {_TIMEOUT_RENDER}s: {e}")
+            return ""
+
+        if render_ok:
             with open(output_path, "rb") as f:
                 jpg_data = f.read()
             elapsed_ms = int((time.time() - start) * 1000)
@@ -186,6 +299,9 @@ def render_frame(width, height, samples=1, quality=75):
             _log(f"{width}x{height} @{samples}spp+{denoiser} {elapsed_ms}ms {len(jpg_data)//1024}KB")
             return result_b64
         _log("Render produced no output")
+        return ""
+    except TimeoutError as e:
+        _log(f"[TIMEOUT] Render timeout: {e}")
         return ""
     except Exception as e:
         _log(f"Render error: {e}")
@@ -346,21 +462,39 @@ class WorkerHandler(BaseHTTPRequestHandler):
                             output_path = os.path.join(output_dir, "final.png")
                             scene.render.filepath = output_path
                             start = time.time()
-                            bpy.ops.render.render(write_still=True)
-                            elapsed_ms = int((time.time() - start) * 1000)
-                            if os.path.isfile(output_path):
-                                with open(output_path, "rb") as f:
-                                    png_data = f.read()
-                                _log(f"Final {width}x{height}@{samples}spp {elapsed_ms}ms {len(png_data)//1024}KB")
-                                response = {
-                                    "type":       "render_result",
-                                    "png_b64":    base64.b64encode(png_data).decode("ascii"),
-                                    "width":      width,
-                                    "height":     height,
-                                    "elapsed_ms": elapsed_ms,
-                                }
+
+                            # Run final render with timeout protection
+                            try:
+                                render_ok = run_with_timeout(
+                                    lambda: _render_frame_impl(scene, output_path),
+                                    _TIMEOUT_RENDER,
+                                    f"render_final({width}x{height}@{samples}spp)"
+                                )
+                            except TimeoutError as e:
+                                _log(f"[TIMEOUT_ERROR] Final render exceeded {_TIMEOUT_RENDER}s: {e}")
+                                response = {"type": "error", "message": f"Render timeout: {e}"}
+                                render_ok = False
+
+                            if render_ok:
+                                elapsed_ms = int((time.time() - start) * 1000)
+                                if os.path.isfile(output_path):
+                                    with open(output_path, "rb") as f:
+                                        png_data = f.read()
+                                    _log(f"Final {width}x{height}@{samples}spp {elapsed_ms}ms {len(png_data)//1024}KB")
+                                    response = {
+                                        "type":       "render_result",
+                                        "png_b64":    base64.b64encode(png_data).decode("ascii"),
+                                        "width":      width,
+                                        "height":     height,
+                                        "elapsed_ms": elapsed_ms,
+                                    }
+                                else:
+                                    response = {"type": "error", "message": "No output produced"}
                             else:
-                                response = {"type": "error", "message": "No output produced"}
+                                response = {"type": "error", "message": "Render failed"}
+                    except TimeoutError as e:
+                        _log(f"[TIMEOUT] Final render timeout: {e}")
+                        response = {"type": "error", "message": f"Render timeout: {e}"}
                     except Exception as e:
                         _log(f"Render final error: {e}")
                         response = {"type": "error", "message": str(e)}
@@ -457,12 +591,23 @@ def main():
                     target_window = bpy.context.window or (bpy.context.window_manager.windows[0] if bpy.context.window_manager.windows else None)
                     _debug(f"Target window for override: {target_window}")
 
-                    with bpy.context.temp_override(window=target_window):
-                        _debug(f"Context override entered, calling open_mainfile...")
+                    def _open_mainfile_impl():
+                        with bpy.context.temp_override(window=target_window):
+                            _debug(f"Context override entered, calling open_mainfile...")
+                            bpy.ops.wm.open_mainfile(filepath=path_to_load)
+
+                    try:
                         open_start = time.time()
-                        bpy.ops.wm.open_mainfile(filepath=path_to_load)
+                        run_with_timeout(
+                            _open_mainfile_impl,
+                            _TIMEOUT_LOAD_FILE,
+                            f"open_mainfile({os.path.basename(path_to_load)})"
+                        )
                         open_elapsed = time.time() - open_start
                         _log(f"[LOAD_MAINFILE_OK] File opened successfully ({open_elapsed:.2f}s)")
+                    except TimeoutError as e:
+                        _log(f"[TIMEOUT_ERROR] open_mainfile exceeded {_TIMEOUT_LOAD_FILE}s: {e}")
+                        raise
 
                     _debug(f"Context override exited")
 
