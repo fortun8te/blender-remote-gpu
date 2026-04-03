@@ -21,6 +21,7 @@ b36: EXTREME DEBUG LOGGING - diagnose every step:
 import sys
 import os
 import traceback
+from collections import deque
 
 # Try to import psutil for memory tracking (optional)
 try:
@@ -54,6 +55,12 @@ _compute_type   = "NONE"
 _pending_path = None
 _pending_lock = threading.Lock()
 
+# Retry queue for failed scene loads
+# Each entry: (path, attempt_count, last_retry_time)
+_load_retry_queue = deque(maxlen=5)  # Max 5 retries per path
+_retry_lock = threading.Lock()
+_retry_backoff_seconds = [0.5, 1.0, 2.0, 4.0, 8.0]  # Exponential backoff per attempt
+
 _start_time = time.time()
 
 def _elapsed():
@@ -75,6 +82,18 @@ def _debug(msg):
             _log(f"[DEBUG] {msg} | Threads={threading.active_count()}")
     except:
         _log(f"[DEBUG] {msg}")
+
+
+def _should_retry_now(last_retry_time, attempt):
+    """
+    Check if enough time has passed for the next retry attempt.
+    attempt is 0-indexed (0 = first retry, 1 = second retry, etc.)
+    """
+    if attempt >= len(_retry_backoff_seconds):
+        return False  # Max retries exceeded
+    backoff = _retry_backoff_seconds[attempt]
+    elapsed = time.time() - last_retry_time
+    return elapsed >= backoff
 
 
 # ── GPU setup ─────────────────────────────────────────────────
@@ -370,14 +389,30 @@ def main():
 
     try:
         while True:
-            # Check for pending scene load (set by HTTP handler thread)
-            with _pending_lock:
-                path = _pending_path
-                _pending_path = None
+            path_to_load = None
+            retry_info = None
 
-            if path:
-                _log(f"[LOAD_START] Path: {path}")
-                _debug(f"File exists: {os.path.isfile(path)}, Size: {os.path.getsize(path) if os.path.isfile(path) else 'N/A'} bytes")
+            # Priority 1: Check retry queue for paths that need retry
+            with _retry_lock:
+                if _load_retry_queue:
+                    queued_path, attempt, last_retry_time = _load_retry_queue[0]
+                    if _should_retry_now(last_retry_time, attempt):
+                        retry_info = _load_retry_queue.popleft()
+                        path_to_load = queued_path
+                        _log(f"[RETRY_{attempt + 1}/5] Retrying load: {queued_path} (backoff elapsed)")
+
+            # Priority 2: Check for fresh pending path (HTTP handler queued)
+            if not path_to_load:
+                with _pending_lock:
+                    path_to_load = _pending_path
+                    _pending_path = None
+
+            if path_to_load:
+                is_retry = retry_info is not None
+                attempt_num = retry_info[1] if retry_info else 0
+
+                _log(f"[LOAD_START] Path: {path_to_load}" + (f" [RETRY_{attempt_num + 1}/5]" if is_retry else ""))
+                _debug(f"File exists: {os.path.isfile(path_to_load)}, Size: {os.path.getsize(path_to_load) if os.path.isfile(path_to_load) else 'N/A'} bytes")
 
                 with _state_lock:
                     # Set state ATOMICALLY: both flags together
@@ -399,7 +434,7 @@ def main():
                     with bpy.context.temp_override(window=target_window):
                         _debug(f"Context override entered, calling open_mainfile...")
                         open_start = time.time()
-                        bpy.ops.wm.open_mainfile(filepath=path)
+                        bpy.ops.wm.open_mainfile(filepath=path_to_load)
                         open_elapsed = time.time() - open_start
                         _log(f"[LOAD_MAINFILE_OK] File opened successfully ({open_elapsed:.2f}s)")
 
@@ -429,6 +464,16 @@ def main():
                     with _state_lock:
                         _scene_loaded = False
                     _debug(f"Error state set")
+
+                    # Push to retry queue if under max attempts
+                    with _retry_lock:
+                        next_attempt = attempt_num + 1
+                        if next_attempt < 5:
+                            _load_retry_queue.append((path_to_load, next_attempt, time.time()))
+                            _log(f"[RETRY_QUEUED] Attempt {next_attempt}/5 scheduled for {_retry_backoff_seconds[next_attempt]:.1f}s")
+                        else:
+                            _log(f"[RETRY_EXHAUSTED] Failed after 5 attempts, giving up: {path_to_load}")
+
                 finally:
                     with _state_lock:
                         _scene_loading = False
