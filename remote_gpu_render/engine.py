@@ -1,4 +1,11 @@
-"""Remote GPU render engine — F12 render + live viewport streaming."""
+"""Remote GPU render engine b24 — F12 render + progressive live viewport.
+
+b24 upgrades:
+- Progressive viewport: 1 → 4 → 16 samples, each result shown immediately
+- Version-based cancellation: new camera position cancels stale renders
+- Reliable image decode: PIL/numpy fast path + bpy.app.timers fallback (no PIL needed)
+- Camera-only change detection: skips upload when only view matrix changed
+"""
 
 import bpy
 import array
@@ -51,9 +58,13 @@ class RemoteRenderEngine(bpy.types.RenderEngine):
     bl_use_gpu_context = True
     bl_use_eevee_viewport = True
 
-    _connection = None       # Shared connection
-    _scene_id = None         # Cached scene ID on server
-    _scene_uploaded = False  # Whether scene has been uploaded this session
+    _connection = None
+    _scene_id = None
+    _scene_uploaded = False
+
+    # b24: version counter for progressive render cancellation
+    # Each new camera position increments this; running threads compare against it
+    _vp_version = 0
 
     def __init__(self):
         self.draw_data = None
@@ -82,7 +93,6 @@ class RemoteRenderEngine(bpy.types.RenderEngine):
         self.update_stats("", "Saving scene...")
         self.update_progress(0.0)
 
-        # Save and encode scene
         blend_b64 = self._save_scene_b64()
         if not blend_b64:
             self.report({"ERROR"}, "Failed to save scene")
@@ -91,14 +101,12 @@ class RemoteRenderEngine(bpy.types.RenderEngine):
         if self.test_break():
             return
 
-        size_kb = len(blend_b64) * 3 // 4 // 1024  # Approximate decoded size
+        size_kb = len(blend_b64) * 3 // 4 // 1024
         self.update_stats("", f"Uploading scene ({size_kb} KB)...")
         self.update_progress(0.1)
 
-        # Upload scene to cache, then render from cache
         scene_id = conn.upload_scene(blend_b64)
         if not scene_id:
-            # Fallback: inline render
             job_id = conn.submit_render(blend_b64, width, height, samples)
         else:
             RemoteRenderEngine._scene_id = scene_id
@@ -112,7 +120,6 @@ class RemoteRenderEngine(bpy.types.RenderEngine):
         self.update_stats("", f"Rendering on {conn.gpu_name}...")
         self.update_progress(0.2)
 
-        # Poll for completion
         start_time = time.time()
         while True:
             if self.test_break():
@@ -146,7 +153,6 @@ class RemoteRenderEngine(bpy.types.RenderEngine):
                 self.report({"ERROR"}, "Timed out (10 min)")
                 return
 
-        # Fetch and display result
         result_data = conn.get_result(job_id)
         if not result_data or not result_data.get("png_b64"):
             self.report({"ERROR"}, "Empty result")
@@ -202,7 +208,11 @@ class RemoteRenderEngine(bpy.types.RenderEngine):
 
     def view_update(self, context, depsgraph):
         """Called when scene changes in viewport Rendered mode.
-        Upload scene once, then stream camera updates."""
+
+        b24 upgrade: progressive sampling (1→4→16) with version-based
+        cancellation so stale renders don't overwrite new camera positions.
+        Camera-only changes skip scene re-upload.
+        """
         conn = RemoteRenderEngine._connection
         if not conn or not conn.connected:
             return
@@ -216,15 +226,25 @@ class RemoteRenderEngine(bpy.types.RenderEngine):
         if w < 1 or h < 1:
             return
 
-        # Upload scene on first enter or when scene changes
-        scene_changed = False
+        # Detect what actually changed
+        geo_changed = False
         for update in depsgraph.updates:
-            if update.is_updated_geometry or update.is_updated_transform:
-                scene_changed = True
+            if update.is_updated_geometry or update.is_updated_shading:
+                geo_changed = True
                 break
 
-        if not RemoteRenderEngine._scene_uploaded or scene_changed:
-            # Upload scene in background (don't block UI)
+        # Current view matrix
+        view_matrix = [list(row) for row in rv3d.view_matrix]
+        proj_matrix = [list(row) for row in rv3d.window_matrix]
+
+        # Skip if nothing changed
+        camera_moved = (view_matrix != self._last_view_matrix)
+        if not camera_moved and not geo_changed and RemoteRenderEngine._scene_uploaded:
+            return
+        self._last_view_matrix = view_matrix
+
+        # Need to (re-)upload scene?
+        if not RemoteRenderEngine._scene_uploaded or geo_changed:
             def _upload():
                 blend_b64 = self._save_scene_b64()
                 if blend_b64:
@@ -240,68 +260,126 @@ class RemoteRenderEngine(bpy.types.RenderEngine):
                 self._viewport_thread.start()
             return
 
-        # Scene is cached — send viewport render request
-        if self._viewport_thread and self._viewport_thread.is_alive():
-            return  # Still working on previous frame
-
-        view_matrix = [list(row) for row in rv3d.view_matrix]
-        proj_matrix = [list(row) for row in rv3d.window_matrix]
-
-        # Skip if camera hasn't moved
-        if view_matrix == self._last_view_matrix:
-            return
-        self._last_view_matrix = view_matrix
-
         scene_id = RemoteRenderEngine._scene_id
         if not scene_id:
             return
 
-        # Cap resolution for speed
+        # Cap viewport resolution for speed
         vp_w = min(w, 960)
         vp_h = min(h, 540)
 
-        def _render_viewport():
-            try:
-                result = conn.viewport_render(scene_id, vp_w, vp_h, view_matrix, proj_matrix)
-                if not result:
+        # b24: bump version — any in-flight progressive render sees this and stops
+        RemoteRenderEngine._vp_version += 1
+        my_version = RemoteRenderEngine._vp_version
+
+        def _progressive_render():
+            """Render at 1 → 4 → 16 samples, showing each result immediately.
+            Stops early if _vp_version has changed (newer camera position arrived).
+            With OptiX denoiser on worker: 1spp already looks clean.
+            """
+            sample_levels = [1, 4, 16]
+
+            for samples in sample_levels:
+                # Check if superseded by a newer request
+                if RemoteRenderEngine._vp_version != my_version:
                     return
 
-                # Worker returns jpg_b64, fallback returns png_b64
-                img_b64 = result.get("jpg_b64") or result.get("png_b64", "")
-                if img_b64:
-                    img_bytes = base64.b64decode(img_b64)
-                    self._update_viewport_pixels(w, h, img_bytes)
-                    self.tag_redraw()
-            except Exception as e:
-                print(f"[RemoteGPU] Viewport error: {e}")
+                try:
+                    result = conn.viewport_render(
+                        scene_id, vp_w, vp_h, view_matrix, proj_matrix,
+                        samples=samples
+                    )
+                    if not result:
+                        return
 
-        self._viewport_thread = threading.Thread(target=_render_viewport, daemon=True)
+                    # Check again — render took time, new camera may have arrived
+                    if RemoteRenderEngine._vp_version != my_version:
+                        return
+
+                    img_b64 = result.get("jpg_b64") or result.get("png_b64", "")
+                    if img_b64:
+                        img_bytes = base64.b64decode(img_b64)
+                        self._update_viewport_pixels(vp_w, vp_h, img_bytes)
+                        self.tag_redraw()
+
+                except Exception as e:
+                    print(f"[RemoteGPU] Viewport error (spp={samples}): {e}")
+                    return
+
+        self._viewport_thread = threading.Thread(target=_progressive_render, daemon=True)
         self._viewport_thread.start()
 
-    def _update_viewport_pixels(self, width, height, png_bytes):
-        """Decode PNG to float pixels for viewport texture."""
+    def _update_viewport_pixels(self, width, height, img_bytes):
+        """Decode JPEG/PNG bytes to float RGBA pixels for GPUTexture.
+
+        b24: PIL/numpy fast path + bpy.app.timers fallback so it works
+        even without PIL installed in Blender's Python.
+        """
+        # Fast path: PIL + numpy (no main thread needed)
         try:
             import numpy as np
             from PIL import Image
             from io import BytesIO
 
-            img = Image.open(BytesIO(png_bytes))
-            img = img.convert("RGBA")
+            img = Image.open(BytesIO(img_bytes)).convert("RGBA")
             img = img.resize((width, height))
-            pixels = np.array(img, dtype=np.float32) / 255.0
-            pixels = np.flipud(pixels)
-            flat = pixels.flatten().tolist()
+            pixels = np.flipud(np.array(img, dtype=np.float32) / 255.0).flatten().tolist()
 
             if self.draw_data:
-                self.draw_data.update(width, height, flat)
+                self.draw_data.update(width, height, pixels)
             else:
-                self.draw_data = ViewportDrawData(width, height, flat)
+                self.draw_data = ViewportDrawData(width, height, pixels)
+            return
+
         except ImportError:
-            # No PIL — write to temp file and load with Blender
-            # (can't call bpy from thread, so skip viewport in this case)
-            pass
+            pass  # PIL not available — use timer fallback
         except Exception as e:
-            print(f"[RemoteGPU] Pixel decode error: {e}")
+            print(f"[RemoteGPU] PIL decode error: {e}")
+
+        # Fallback: write temp file, load via bpy on main thread using timer
+        # bpy.data.images.load() must run on the main thread — timers fire there.
+        suffix = ".jpg" if img_bytes[:2] == b'\xff\xd8' else ".png"
+        try:
+            tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+            tmp.write(img_bytes)
+            tmp.close()
+            tmp_path = tmp.name
+        except Exception as e:
+            print(f"[RemoteGPU] Temp file error: {e}")
+            return
+
+        engine_ref = self
+
+        def _load_on_main_thread():
+            """Runs on Blender main thread — safe to call bpy here."""
+            try:
+                bpy_img = bpy.data.images.load(tmp_path, check_existing=False)
+                img_w, img_h = bpy_img.size
+                pix = list(bpy_img.pixels[:])
+                bpy.data.images.remove(bpy_img)
+
+                # Flip vertically (Blender pixels are bottom-up, we need top-down)
+                row_stride = img_w * 4
+                rows = [pix[i:i + row_stride] for i in range(0, len(pix), row_stride)]
+                flat = [v for row in reversed(rows) for v in row]
+
+                if engine_ref.draw_data:
+                    engine_ref.draw_data.update(img_w, img_h, flat)
+                else:
+                    engine_ref.draw_data = ViewportDrawData(img_w, img_h, flat)
+
+                engine_ref.tag_redraw()
+
+            except Exception as e:
+                print(f"[RemoteGPU] Timer pixel load error: {e}")
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+            return None  # Returning None removes the timer (don't repeat)
+
+        bpy.app.timers.register(_load_on_main_thread, first_interval=0.0)
 
     def view_draw(self, context, depsgraph):
         """Called every viewport redraw — blit the latest texture."""

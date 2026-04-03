@@ -214,7 +214,7 @@ def handle_message(data):
             "vram_free": GPU_VRAM,
             "timestamp": time.time(),
             "version": "3.0.0",
-            "build": "b23",
+            "build": "b24",
             "worker_ready": worker_ready,
         }
 
@@ -239,6 +239,15 @@ def handle_message(data):
                 f.write(blend_data)
             return {"type": "scene_cached", "scene_id": scene_id}
 
+    # ── Camera-only update (no render) — b24 addition ──
+    elif msg_type == "camera_update":
+        if not worker_ready:
+            return {"type": "error", "message": "Worker not ready"}
+        return send_to_worker({
+            "type": "update_camera",
+            "view_matrix": data.get("view_matrix"),
+        }, timeout=5)
+
     # ── Viewport Render → forward to worker (FAST path) ──
     elif msg_type == "viewport_render":
         if not worker_ready:
@@ -248,10 +257,10 @@ def handle_message(data):
             "type": "render_frame",
             "width": data.get("width", 640),
             "height": data.get("height", 360),
-            "samples": data.get("samples", 16),
-            "quality": data.get("quality", 60),
+            "samples": data.get("samples", 1),   # b24: default 1 (denoiser handles quality)
+            "quality": data.get("quality", 75),   # b24: bumped quality
             "view_matrix": data.get("view_matrix"),
-        }, timeout=10)
+        }, timeout=15)
 
         if result.get("type") == "frame_result":
             return {
@@ -421,7 +430,7 @@ def main():
     blender = find_blender()
 
     log.info("=" * 55)
-    log.info("Blender Remote GPU Render Server v3.0 (b23)")
+    log.info("Blender Remote GPU Render Server v3.0 (b24)")
     log.info(f"  GPU:     {GPU_NAME} ({GPU_VRAM} MB)")
     log.info(f"  Blender: {blender or 'NOT FOUND'}")
     log.info(f"  HTTP:    :{HTTP_PORT}  TCP: :{SOCKET_PORT}  XMLRPC: :{XMLRPC_PORT}")

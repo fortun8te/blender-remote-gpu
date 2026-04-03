@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Persistent Blender Render Worker — runs INSIDE Blender, keeps scene in GPU memory.
+Persistent Blender Render Worker b24 — runs INSIDE Blender, keeps scene in GPU memory.
 
 Launch: blender --background --python render_worker.py
 
-This script:
-1. Opens an HTTP listener inside Blender's Python environment
-2. Accepts scene_load, set_camera, render_frame commands
-3. Keeps the scene loaded in GPU memory between frames
-4. Returns JPEG frames in ~100-300ms instead of 1-3s
+Upgrades in b24:
+- OptiX AI denoiser (Tensor Cores): clean frames at 1 sample
+- Falls back to CUDA → CPU if OptiX unavailable
+- update_camera command: set camera without re-rendering
+- Default viewport samples = 1 (denoiser handles quality)
 """
 
 import bpy
@@ -22,34 +22,60 @@ import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from io import BytesIO
 
-# Configuration
 WORKER_PORT = int(os.environ.get("WORKER_PORT", "9880"))
 
-# State
 _scene_loaded = False
 _scene_path = ""
 _last_render_b64 = ""
 _rendering = False
 _render_lock = threading.Lock()
 
+# Which compute type is active ("OPTIX", "CUDA", "NONE")
+_compute_type = "NONE"
+
 
 def setup_gpu():
-    """Enable GPU rendering in Cycles."""
+    """Enable GPU rendering — try OptiX first (RTX Tensor Core denoiser), fall back to CUDA."""
+    global _compute_type
+
     try:
         prefs = bpy.context.preferences
-        cycles = prefs.addons.get("cycles")
-        if cycles:
-            cycles.preferences.compute_device_type = "CUDA"
-            cycles.preferences.get_devices()
-            for device in cycles.preferences.devices:
-                device.use = True
-                print(f"[Worker] GPU device: {device.name} (enabled={device.use})")
+        cycles_addon = prefs.addons.get("cycles")
+        if cycles_addon:
+            # OptiX = faster denoising on RTX cards via Tensor Cores
+            for device_type in ("OPTIX", "CUDA"):
+                try:
+                    cycles_addon.preferences.compute_device_type = device_type
+                    cycles_addon.preferences.get_devices()
+                    devices = list(cycles_addon.preferences.devices)
+                    if devices:
+                        for d in devices:
+                            d.use = True
+                            print(f"[Worker] Device: {d.name} ({device_type}, use={d.use})")
+                        _compute_type = device_type
+                        print(f"[Worker] Compute backend: {device_type}")
+                        break
+                except Exception as e:
+                    print(f"[Worker] {device_type} unavailable: {e}")
+                    continue
 
         bpy.context.scene.render.engine = "CYCLES"
         bpy.context.scene.cycles.device = "GPU"
-        print("[Worker] GPU rendering enabled")
+        print(f"[Worker] GPU rendering enabled ({_compute_type})")
     except Exception as e:
         print(f"[Worker] GPU setup warning: {e}")
+
+
+def _enable_denoiser(scene):
+    """Enable OptiX AI denoiser (falls back to OpenImageDenoise if OptiX unavailable)."""
+    scene.cycles.use_denoising = True
+    try:
+        if _compute_type == "OPTIX":
+            scene.cycles.denoiser = "OPTIX"
+        else:
+            scene.cycles.denoiser = "OPENIMAGEDENOISE"
+    except Exception:
+        pass  # Older Blender versions don't have denoiser property
 
 
 def load_scene(blend_path):
@@ -72,14 +98,12 @@ def load_scene_from_b64(blend_b64):
     tmp.write(blend_data)
     tmp.close()
     load_scene(tmp.name)
-    # Don't delete — Blender keeps reference to it
 
 
 def set_camera_from_matrix(view_matrix_flat):
-    """Set the scene camera to match the given 4x4 view matrix."""
+    """Set the scene camera to match the given 4x4 view matrix (flat list of 16 floats)."""
     import mathutils
 
-    # Get or create viewport camera
     cam_data = bpy.data.cameras.get("_remote_cam")
     if not cam_data:
         cam_data = bpy.data.cameras.new("_remote_cam")
@@ -91,7 +115,6 @@ def set_camera_from_matrix(view_matrix_flat):
 
     bpy.context.scene.camera = cam_obj
 
-    # Set camera from view matrix (inverted because view_matrix = world_to_camera)
     m = mathutils.Matrix((
         view_matrix_flat[0:4],
         view_matrix_flat[4:8],
@@ -101,8 +124,12 @@ def set_camera_from_matrix(view_matrix_flat):
     cam_obj.matrix_world = m.inverted()
 
 
-def render_frame(width, height, samples=16, quality=70):
-    """Render current scene and return JPEG as base64."""
+def render_frame(width, height, samples=1, quality=75):
+    """Render current scene with AI denoising and return JPEG as base64.
+
+    b24: default samples=1 — OptiX AI denoiser gives clean results at 1 sample.
+    quality=75 is a good balance of file size vs visual quality for viewport.
+    """
     global _last_render_b64, _rendering
 
     scene = bpy.context.scene
@@ -110,10 +137,13 @@ def render_frame(width, height, samples=16, quality=70):
     scene.render.resolution_y = height
     scene.render.resolution_percentage = 100
     scene.cycles.samples = samples
+
+    # AI denoiser — main quality upgrade in b24
+    _enable_denoiser(scene)
+
     scene.render.image_settings.file_format = "JPEG"
     scene.render.image_settings.quality = quality
 
-    # Render to memory
     output_dir = tempfile.mkdtemp(prefix="wrkr_")
     output_path = os.path.join(output_dir, "frame.jpg")
     scene.render.filepath = output_path
@@ -130,7 +160,8 @@ def render_frame(width, height, samples=16, quality=70):
 
             elapsed_ms = int((time.time() - start) * 1000)
             _last_render_b64 = base64.b64encode(jpg_data).decode("ascii")
-            print(f"[Worker] Frame: {width}x{height} @ {samples}spp in {elapsed_ms}ms ({len(jpg_data)} bytes)")
+            denoiser = getattr(scene.cycles, "denoiser", "?")
+            print(f"[Worker] Frame {width}x{height} @ {samples}spp+{denoiser} in {elapsed_ms}ms ({len(jpg_data)//1024}KB)")
             return _last_render_b64
         else:
             print("[Worker] Render produced no output")
@@ -140,7 +171,6 @@ def render_frame(width, height, samples=16, quality=70):
         return ""
     finally:
         _rendering = False
-        # Cleanup
         try:
             os.remove(output_path)
             os.rmdir(output_dir)
@@ -164,8 +194,10 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 response = {
                     "type": "pong",
                     "worker": True,
+                    "build": "b24",
                     "scene_loaded": _scene_loaded,
                     "rendering": _rendering,
+                    "compute": _compute_type,
                 }
 
             elif msg_type == "load_scene":
@@ -178,7 +210,22 @@ class WorkerHandler(BaseHTTPRequestHandler):
                     response = {
                         "type": "scene_loaded",
                         "objects": len(bpy.data.objects),
+                        "compute": _compute_type,
                     }
+
+            elif msg_type == "update_camera":
+                # Fast path: just set camera, no render — b24 addition
+                view_matrix = data.get("view_matrix")
+                if not _scene_loaded:
+                    response = {"type": "error", "message": "No scene loaded"}
+                elif view_matrix:
+                    flat = ([x for row in view_matrix for x in row]
+                            if isinstance(view_matrix[0], list) else view_matrix)
+                    with _render_lock:
+                        set_camera_from_matrix(flat)
+                    response = {"type": "camera_updated"}
+                else:
+                    response = {"type": "error", "message": "No view_matrix"}
 
             elif msg_type == "render_frame":
                 if not _scene_loaded:
@@ -186,17 +233,14 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 else:
                     width = data.get("width", 640)
                     height = data.get("height", 360)
-                    samples = data.get("samples", 16)
-                    quality = data.get("quality", 70)
+                    samples = data.get("samples", 1)   # b24: default 1 (denoiser handles quality)
+                    quality = data.get("quality", 75)  # b24: bumped from 70 to 75
                     view_matrix = data.get("view_matrix")
 
                     with _render_lock:
                         if view_matrix:
-                            # Flatten nested list if needed
-                            if isinstance(view_matrix[0], list):
-                                flat = [x for row in view_matrix for x in row]
-                            else:
-                                flat = view_matrix
+                            flat = ([x for row in view_matrix for x in row]
+                                    if isinstance(view_matrix[0], list) else view_matrix)
                             set_camera_from_matrix(flat)
 
                         jpg_b64 = render_frame(width, height, samples, quality)
@@ -206,6 +250,8 @@ class WorkerHandler(BaseHTTPRequestHandler):
                         "jpg_b64": jpg_b64,
                         "width": width,
                         "height": height,
+                        "samples": samples,
+                        "compute": _compute_type,
                     }
 
             elif msg_type == "render_final":
@@ -217,28 +263,35 @@ class WorkerHandler(BaseHTTPRequestHandler):
                     samples = data.get("samples", 128)
 
                     with _render_lock:
-                        # For final render, use PNG and high quality
                         scene = bpy.context.scene
                         scene.render.resolution_x = width
                         scene.render.resolution_y = height
                         scene.render.resolution_percentage = 100
                         scene.cycles.samples = samples
+
+                        # Enable denoiser for final renders too
+                        _enable_denoiser(scene)
+
                         scene.render.image_settings.file_format = "PNG"
 
                         output_dir = tempfile.mkdtemp(prefix="final_")
                         output_path = os.path.join(output_dir, "final.png")
                         scene.render.filepath = output_path
 
+                        start = time.time()
                         bpy.ops.render.render(write_still=True)
+                        elapsed_ms = int((time.time() - start) * 1000)
 
                         if os.path.isfile(output_path):
                             with open(output_path, "rb") as f:
                                 png_data = f.read()
+                            print(f"[Worker] Final {width}x{height} @ {samples}spp in {elapsed_ms}ms ({len(png_data)//1024}KB)")
                             response = {
                                 "type": "render_result",
                                 "png_b64": base64.b64encode(png_data).decode("ascii"),
                                 "width": width,
                                 "height": height,
+                                "elapsed_ms": elapsed_ms,
                             }
                             os.remove(output_path)
                         else:
@@ -256,7 +309,7 @@ class WorkerHandler(BaseHTTPRequestHandler):
             self.wfile.write(resp_bytes)
 
         except Exception as e:
-            print(f"[Worker] Error: {e}")
+            print(f"[Worker] Handler error: {e}")
             err = json.dumps({"type": "error", "message": str(e)}).encode("utf-8")
             self.send_response(500)
             self.send_header("Content-Type", "application/json")
@@ -273,22 +326,19 @@ class WorkerHandler(BaseHTTPRequestHandler):
 def main():
     setup_gpu()
 
-    print("=" * 50)
-    print(f"[Worker] Blender Render Worker starting on port {WORKER_PORT}")
+    print("=" * 55)
+    print(f"[Worker] Blender Render Worker b24 on port {WORKER_PORT}")
     print(f"[Worker] Blender {bpy.app.version_string}")
-    print(f"[Worker] Scene in GPU memory — persistent process")
-    print("=" * 50)
+    print(f"[Worker] Compute: {_compute_type} | Denoiser: OptiX/OIDN")
+    print(f"[Worker] 1 sample + AI denoiser = fast clean viewport")
+    print("=" * 55)
 
-    # Start HTTP server in a thread
     server = HTTPServer(("0.0.0.0", WORKER_PORT), WorkerHandler)
-
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     print(f"[Worker] HTTP listener on port {WORKER_PORT}")
     print("[Worker] Ready for commands")
 
-    # Keep Blender alive
-    # In background mode, we need to prevent Blender from exiting
     try:
         while True:
             time.sleep(1)

@@ -1,13 +1,13 @@
 """Remote GPU Render — offload Cycles rendering to a remote GPU over HTTP."""
 
-__version__ = "1.0.23"
-BUILD = "b23"
+__version__ = "1.0.24"
+BUILD = "b24"
 BUILD_DATE = "2026-04-03"
 
 bl_info = {
     "name": "Remote GPU Render",
     "author": "Michael Knaap",
-    "version": (1, 0, 20),
+    "version": (1, 0, 24),
     "blender": (4, 0, 0),
     "location": "Render Properties > Render Engine > Remote GPU",
     "description": "Render on a remote GPU server over your network",
