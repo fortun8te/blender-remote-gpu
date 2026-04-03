@@ -5,8 +5,8 @@ b29: Added importlib.reload() pattern so re-installing without a Blender
      Panel classes stay in __init__.py (b28 fix for Blender 5.0 metaclass).
 """
 
-__version__ = "1.0.35"
-BUILD = "b35"
+__version__ = "1.0.37"
+BUILD = "b37"
 BUILD_DATE = "2026-04-03"
 
 bl_info = {
