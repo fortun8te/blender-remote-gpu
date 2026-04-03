@@ -40,6 +40,14 @@ class REMOTEGPU_PT_panel(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
 
+        # Show version info
+        try:
+            from . import BUILD, BUILD_DATE
+            version_box = layout.box()
+            version_box.label(text=f"Remote GPU {BUILD} ({BUILD_DATE})", icon="INFO")
+        except ImportError:
+            pass
+
         try:
             addon = context.preferences.addons.get("addon")
             if not addon or not addon.preferences:
