@@ -263,18 +263,15 @@ class RemoteRenderEngine(bpy.types.RenderEngine):
         def _render_viewport():
             try:
                 result = conn.viewport_render(scene_id, vp_w, vp_h, view_matrix, proj_matrix)
-                if result and result.get("png_b64"):
-                    png_bytes = base64.b64decode(result["png_b64"])
-                    self._update_viewport_pixels(w, h, png_bytes)
+                if not result:
+                    return
+
+                # Worker returns jpg_b64, fallback returns png_b64
+                img_b64 = result.get("jpg_b64") or result.get("png_b64", "")
+                if img_b64:
+                    img_bytes = base64.b64decode(img_b64)
+                    self._update_viewport_pixels(w, h, img_bytes)
                     self.tag_redraw()
-                elif result and result.get("status") == "queued":
-                    # Frame is being rendered, poll for it
-                    time.sleep(0.5)
-                    poll = conn.viewport_poll(scene_id)
-                    if poll and poll.get("png_b64"):
-                        png_bytes = base64.b64decode(poll["png_b64"])
-                        self._update_viewport_pixels(w, h, png_bytes)
-                        self.tag_redraw()
             except Exception as e:
                 print(f"[RemoteGPU] Viewport error: {e}")
 
