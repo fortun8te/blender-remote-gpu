@@ -225,33 +225,35 @@ def handle_message(data):
         if not blend_b64:
             return {"type": "error", "message": "No blend_data"}
 
+        # Always save to a shared temp file first — worker reads from disk,
+        # so we never send the large blob over the local socket
+        scene_id   = str(uuid.uuid4())[:8]
+        blend_data = base64.b64decode(blend_b64)
+        blend_path = os.path.join(tempfile.gettempdir(), f"scene_{scene_id}.blend")
+        with open(blend_path, "wb") as f:
+            f.write(blend_data)
+        size_mb = len(blend_data) / 1_048_576
+        log.info(f"Scene saved to {blend_path} ({size_mb:.1f} MB)")
+
         if worker_ready:
-            # Tell worker to queue the load (returns immediately as "scene_loading")
-            result = send_to_worker({"type": "load_scene", "blend_data": blend_b64}, timeout=120)
+            # Send just the file PATH — no large data over the socket
+            result = send_to_worker({"type": "load_scene_path", "path": blend_path}, timeout=10)
             if result is None:
-                return {"type": "error", "message": "Worker did not respond to load_scene"}
+                return {"type": "error", "message": "Worker did not respond"}
 
             if result.get("type") in ("scene_loading", "scene_loaded"):
-                # Poll until the worker's main thread finishes open_mainfile
                 log.info("Scene queued on worker — polling until loaded...")
-                for attempt in range(120):   # up to 60 seconds
+                for attempt in range(240):   # up to 120 seconds
                     time.sleep(0.5)
                     ping = send_to_worker({"type": "ping"}, timeout=5)
                     if ping and ping.get("scene_loaded"):
                         log.info(f"Worker scene ready (took ~{attempt * 0.5:.1f}s)")
-                        return {"type": "scene_cached", "scene_id": "worker",
-                                "objects": 0}
-                return {"type": "error", "message": "Worker scene load timed out (60s)"}
+                        return {"type": "scene_cached", "scene_id": "worker", "objects": 0}
+                return {"type": "error", "message": "Worker scene load timed out (120s)"}
 
             return result  # pass through any error
         else:
-            # Fallback: save to disk (no persistent worker)
-            scene_id = str(uuid.uuid4())[:8]
-            blend_data = base64.b64decode(blend_b64)
-            path = os.path.join(tempfile.gettempdir(), f"scene_{scene_id}.blend")
-            with open(path, "wb") as f:
-                f.write(blend_data)
-            log.info(f"Scene saved to disk (no worker): {path}")
+            # No worker — file is on disk, scene_id is the path key
             return {"type": "scene_cached", "scene_id": scene_id}
 
     # ── Camera-only update (no render) — b24 addition ──

@@ -101,32 +101,22 @@ def _load_timer():
         print(f"[Worker] open_mainfile failed: {e}")
     finally:
         _scene_loading = False
-        # Clean up the temp file
-        try:
-            os.unlink(path)
-        except Exception:
-            pass
 
     return None  # Unregister timer (one-shot)
 
 
-def _queue_scene_load(blend_b64):
-    """Decode blend data, save to temp file, queue for main-thread load."""
-    global _pending_load_path, _scene_loaded
-
-    blend_data = base64.b64decode(blend_b64)
-    tmp = tempfile.NamedTemporaryFile(suffix=".blend", delete=False)
-    tmp.write(blend_data)
-    tmp.close()
+def _queue_scene_load_path(blend_path):
+    """Queue a blend file path for main-thread loading."""
+    global _scene_loaded
 
     with _pending_load_lock:
-        _pending_load_path = tmp.name
+        _pending_load_path = blend_path
 
     _scene_loaded = False
 
-    # Schedule the load on the main thread (0.05s delay)
+    # Schedule the load on the main thread
     bpy.app.timers.register(_load_timer, first_interval=0.05)
-    print(f"[Worker] Scene load queued ({len(blend_data)//1024} KB) → main thread")
+    print(f"[Worker] Scene load queued: {blend_path} → main thread")
 
 
 # ── Camera helper ─────────────────────────────────────────────
@@ -214,17 +204,33 @@ class WorkerHandler(BaseHTTPRequestHandler):
                     "compute":      _compute_type,
                 }
 
-            elif msg_type == "load_scene":
-                blend_b64 = data.get("blend_data", "")
-                if not blend_b64:
-                    response = {"type": "error", "message": "No blend_data"}
+            elif msg_type in ("load_scene_path", "load_scene"):
+                # load_scene_path = preferred (path only, no large data transfer)
+                # load_scene      = legacy fallback (base64 in body — avoid for large files)
+                if msg_type == "load_scene_path":
+                    blend_path = data.get("path", "")
+                    if not blend_path or not os.path.isfile(blend_path):
+                        response = {"type": "error", "message": f"File not found: {blend_path}"}
+                    else:
+                        _queue_scene_load_path(blend_path)
+                        response = {
+                            "type":    "scene_loading",
+                            "message": "Loading on main thread — poll ping for scene_loaded=true",
+                        }
                 else:
-                    # Queue for main-thread load — DO NOT call open_mainfile here
-                    _queue_scene_load(blend_b64)
-                    response = {
-                        "type":    "scene_loading",
-                        "message": "Loading on main thread — poll ping for scene_loaded=true",
-                    }
+                    # Legacy: base64 in body — save to temp then queue
+                    blend_b64 = data.get("blend_data", "")
+                    if not blend_b64:
+                        response = {"type": "error", "message": "No blend_data"}
+                    else:
+                        tmp = tempfile.NamedTemporaryFile(suffix=".blend", delete=False)
+                        tmp.write(base64.b64decode(blend_b64))
+                        tmp.close()
+                        _queue_scene_load_path(tmp.name)
+                        response = {
+                            "type":    "scene_loading",
+                            "message": "Loading on main thread — poll ping for scene_loaded=true",
+                        }
 
             elif msg_type == "update_camera":
                 view_matrix = data.get("view_matrix")
