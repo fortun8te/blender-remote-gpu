@@ -8,6 +8,7 @@ import time
 import tempfile
 import subprocess
 import shutil
+import platform
 
 # Add shared to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -53,10 +54,56 @@ class RenderServer:
         self.clients = set()
         self.current_scene = None  # Path to latest .blend file
 
+        # FIX #5: Track uploaded files for cleanup
+        self._uploaded_scenes = {}  # {client_addr: [paths]}
+        self._cleanup_interval = 3600  # Cleanup every hour
+        self._last_cleanup = time.time()
+
+    def _cleanup_client_files(self, client_addr):
+        """Remove all uploaded files for a disconnected client (FIX #5)."""
+        if client_addr not in self._uploaded_scenes:
+            return
+
+        files = self._uploaded_scenes.pop(client_addr, [])
+        for filepath in files:
+            try:
+                if os.path.exists(filepath):
+                    os.remove(filepath)
+                    print(f"[Server] Cleaned up: {filepath}")
+            except Exception as e:
+                print(f"[Server] Failed to clean {filepath}: {e}")
+
+    def _cleanup_old_files(self, max_age=86400):
+        """Remove scene files older than max_age seconds (default: 24 hours) (FIX #5)."""
+        print(f"[Server] Running periodic cleanup (files older than {max_age}s)...")
+        current_time = time.time()
+
+        try:
+            for filename in os.listdir(SCENE_DIR):
+                filepath = os.path.join(SCENE_DIR, filename)
+                if not os.path.isfile(filepath):
+                    continue
+
+                if filepath == self.current_scene:
+                    continue
+
+                age = current_time - os.path.getmtime(filepath)
+                if age > max_age:
+                    try:
+                        os.remove(filepath)
+                        print(f"[Server] Cleaned up old file: {filename} (age: {age:.0f}s)")
+                    except Exception as e:
+                        print(f"[Server] Failed to remove {filename}: {e}")
+        except Exception as e:
+            print(f"[Server] Cleanup error: {e}")
+
     async def handle_client(self, websocket):
         addr = websocket.remote_address
         print(f"[Server] Client connected: {addr}")
         self.clients.add(websocket)
+
+        # FIX #5: Initialize cleanup list for this client
+        self._uploaded_scenes[addr] = []
 
         try:
             async for message in websocket:
@@ -72,6 +119,10 @@ class RenderServer:
             print(f"[Server] Error with {addr}: {e}")
         finally:
             self.clients.discard(websocket)
+
+            # FIX #5: Cleanup all files from this client
+            self._cleanup_client_files(addr)
+
             print(f"[Server] Client removed: {addr}")
 
     async def _handle_json(self, ws, raw):
@@ -120,106 +171,290 @@ class RenderServer:
             print(f"[Server] Unknown message type: {msg_type}")
 
     async def _handle_binary(self, ws, data):
-        """Receive binary .blend file data."""
+        """Receive binary .blend file data with automatic cleanup (FIX #5)."""
         scene_name = getattr(self, "_pending_scene_name", "scene.blend")
         scene_path = os.path.join(SCENE_DIR, scene_name)
 
-        with open(scene_path, "wb") as f:
-            f.write(data)
+        try:
+            with open(scene_path, "wb") as f:
+                f.write(data)
 
-        self.current_scene = scene_path
-        print(f"[Server] Scene saved: {scene_path} ({len(data)} bytes)")
+            self.current_scene = scene_path
 
-        await ws.send(json.dumps({"type": SCENE_ACK}))
+            # FIX #5: Track file for cleanup on disconnect
+            client_addr = ws.remote_address
+            if client_addr not in self._uploaded_scenes:
+                self._uploaded_scenes[client_addr] = []
+            self._uploaded_scenes[client_addr].append(scene_path)
+
+            print(f"[Server] Scene saved: {scene_path} ({len(data)} bytes)")
+            await ws.send(json.dumps({"type": SCENE_ACK}))
+
+        except IOError as e:
+            await self._send_error(ws, f"Failed to save scene: {e}")
 
     async def _do_render(self, ws, width, height, samples):
-        """Render the current scene using Blender CLI and return JPEG."""
+        """Render the current scene using Blender CLI and return PNG (FIX #6, #7)."""
         print(f"[Server] Rendering {width}x{height} @ {samples} samples...")
 
-        # Find Blender executable
         blender_path = self._find_blender()
         if not blender_path:
             await self._send_error(ws, "Blender not found on this machine")
             return
 
-        # Output path
-        output_path = os.path.join(SCENE_DIR, "render_output.png")
-
-        # Send progress
-        await ws.send(json.dumps({
-            "type": PROGRESS,
-            "samples_done": 0,
-            "samples_total": samples,
-            "message": "Starting render...",
-        }))
-
-        # Run Blender headless render
-        cmd = [
-            blender_path, "-b", self.current_scene,
-            "-o", os.path.join(SCENE_DIR, "render_output"),
-            "-F", "PNG",
-            "-x", "1",
-            "--python-expr",
-            f"import bpy; s=bpy.context.scene; s.render.resolution_x={width}; s.render.resolution_y={height}; s.cycles.samples={samples}; s.cycles.device='GPU'",
-            "-f", "1",
-        ]
+        output_files = []
 
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
-
-            if proc.returncode != 0:
-                error_msg = stderr.decode()[-200:] if stderr else "Unknown error"
-                await self._send_error(ws, f"Render failed: {error_msg}")
-                return
-
-            # Read the rendered image
-            # Blender appends frame number: render_output0001.png
-            actual_output = os.path.join(SCENE_DIR, "render_output0001.png")
-            if not os.path.exists(actual_output):
-                await self._send_error(ws, "Render output not found")
-                return
-
-            with open(actual_output, "rb") as f:
-                image_data = f.read()
-
-            # Send frame metadata then binary
             await ws.send(json.dumps({
-                "type": FRAME,
-                "width": width,
-                "height": height,
-                "format": "png",
+                "type": PROGRESS,
+                "samples_done": 0,
+                "samples_total": samples,
+                "message": "Starting render...",
             }))
-            await ws.send(image_data)
 
-            print(f"[Server] Render complete, sent {len(image_data)} bytes")
+            cmd = [
+                blender_path, "-b", self.current_scene,
+                "-o", os.path.join(SCENE_DIR, "render_output"),
+                "-F", "PNG",
+                "-x", "1",
+                "--python-expr",
+                f"import bpy; s=bpy.context.scene; s.render.resolution_x={width}; s.render.resolution_y={height}; s.cycles.samples={samples}; s.cycles.device='GPU'",
+                "-f", "1",
+            ]
 
-            # Cleanup
-            os.remove(actual_output)
+            try:
+                # FIX #6: Detailed error on subprocess creation
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        *cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                except FileNotFoundError as e:
+                    await self._send_error(ws, f"Blender not found: {blender_path}\nError: {e}")
+                    return
+                except Exception as e:
+                    await self._send_error(ws, f"Failed to start Blender: {e}")
+                    return
 
-        except asyncio.TimeoutError:
-            await self._send_error(ws, "Render timed out (5 min limit)")
-        except Exception as e:
-            await self._send_error(ws, f"Render error: {str(e)}")
+                # FIX #6: Capture full output
+                try:
+                    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
+                except asyncio.TimeoutError:
+                    try:
+                        proc.kill()
+                        await proc.wait()
+                    except:
+                        pass
+                    await self._send_error(ws, f"Render timed out (5 min)\nCommand: {' '.join(cmd)}")
+                    return
+
+                # FIX #6: Decode with error handling
+                try:
+                    stdout_str = stdout.decode("utf-8", errors="replace") if stdout else ""
+                    stderr_str = stderr.decode("utf-8", errors="replace") if stderr else ""
+                except Exception as e:
+                    await self._send_error(ws, f"Failed to decode output: {e}")
+                    return
+
+                # Log full output
+                print(f"[Server] Blender stdout:\n{stdout_str}")
+                if stderr_str:
+                    print(f"[Server] Blender stderr:\n{stderr_str}")
+
+                # FIX #6: Detailed error on failure
+                if proc.returncode != 0:
+                    error_lines = []
+                    error_lines.append(f"Blender failed with exit code {proc.returncode}")
+                    error_lines.append(f"Command: {' '.join(cmd)}")
+
+                    if stderr_str:
+                        stderr_lines = stderr_str.strip().split("\n")
+                        relevant_error = "\n".join(stderr_lines[-10:])
+                        error_lines.append(f"Error:\n{relevant_error}")
+                    elif stdout_str:
+                        stdout_lines = stdout_str.strip().split("\n")
+                        relevant_output = "\n".join(stdout_lines[-10:])
+                        error_lines.append(f"Output:\n{relevant_output}")
+
+                    error_msg = "\n".join(error_lines)
+                    await self._send_error(ws, error_msg)
+                    return
+
+                # Check for GPU warnings
+                if "GPU" in stderr_str or "device" in stderr_str.lower():
+                    print(f"[Server] GPU info:\n{stderr_str}")
+
+                # FIX #6: Check output exists
+                actual_output = os.path.join(SCENE_DIR, "render_output0001.png")
+                if not os.path.exists(actual_output):
+                    await self._send_error(
+                        ws,
+                        f"Render output not found: {actual_output}\n"
+                        f"Blender exited successfully but no image was created."
+                    )
+                    return
+
+                output_files.append(actual_output)
+
+                with open(actual_output, "rb") as f:
+                    image_data = f.read()
+
+                if not image_data:
+                    await self._send_error(ws, f"Render file is empty: {actual_output}")
+                    return
+
+                # Send result
+                await ws.send(json.dumps({
+                    "type": FRAME,
+                    "width": width,
+                    "height": height,
+                    "format": "png",
+                }))
+                await ws.send(image_data)
+
+                print(f"[Server] Render complete, sent {len(image_data)} bytes")
+
+            except asyncio.TimeoutError:
+                await self._send_error(ws, "Render timed out (5 min limit)")
+            except Exception as e:
+                import traceback
+                await self._send_error(ws, f"Unexpected error: {e}\nTraceback: {traceback.format_exc()}")
+
+        finally:
+            # FIX #7: Cleanup all output files on all error paths
+            for filepath in output_files:
+                try:
+                    if os.path.exists(filepath):
+                        os.remove(filepath)
+                        print(f"[Server] Cleaned up render output: {filepath}")
+                except Exception as e:
+                    print(f"[Server] Failed to cleanup {filepath}: {e}")
+
+            # FIX #5: Periodic cleanup
+            if time.time() - self._last_cleanup > self._cleanup_interval:
+                self._cleanup_old_files()
+                self._last_cleanup = time.time()
 
     def _find_blender(self):
-        """Find Blender executable on this system."""
-        candidates = [
-            shutil.which("blender"),
-            r"C:\Program Files\Blender Foundation\Blender 4.0\blender.exe",
-            r"C:\Program Files\Blender Foundation\Blender 4.1\blender.exe",
-            r"C:\Program Files\Blender Foundation\Blender 4.2\blender.exe",
-            r"C:\Program Files\Blender Foundation\Blender 4.3\blender.exe",
-            r"C:\Program Files\Blender Foundation\Blender 5.0\blender.exe",
-            "/Applications/Blender.app/Contents/MacOS/Blender",
-        ]
-        for path in candidates:
-            if path and os.path.exists(path):
-                return path
+        """Find Blender executable on this system (FIX #4).
+
+        Tries in order:
+        1. PATH environment variable (shutil.which)
+        2. Windows: Registry HKLM/HKCU (uninstall paths)
+        3. Windows: Standard program files paths (all versions 4.x-5.x)
+        4. Windows: Program Files (x86) for 32-bit installs
+        5. macOS: /Applications/Blender.app
+        6. Linux: /usr/bin, /opt, /usr/local/bin
+        """
+        system = platform.system()
+
+        # 1. Try PATH first (most reliable)
+        path = shutil.which("blender")
+        if path:
+            print(f"[Server] Found Blender via PATH: {path}")
+            return path
+
+        # 2. Windows registry lookup
+        if system == "Windows":
+            try:
+                import winreg
+                reg = winreg.ConnectRegistry(None, winreg.HKEY_LOCAL_MACHINE)
+                key = winreg.OpenKey(reg, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall")
+
+                for i in range(winreg.QueryInfoKey(key)[0]):
+                    try:
+                        subkey_name = winreg.EnumKey(key, i)
+                        if "Blender" not in subkey_name:
+                            continue
+
+                        subkey = winreg.OpenKey(key, subkey_name)
+                        try:
+                            install_path = winreg.QueryValueEx(subkey, "InstallLocation")[0]
+                            blender_exe = os.path.join(install_path, "blender.exe")
+                            if os.path.exists(blender_exe):
+                                print(f"[Server] Found Blender via registry: {blender_exe}")
+                                return blender_exe
+                        finally:
+                            winreg.CloseKey(subkey)
+                    except Exception:
+                        continue
+
+                winreg.CloseKey(key)
+            except Exception as e:
+                print(f"[Server] Registry lookup failed: {e}")
+
+        # 3. Platform-specific hardcoded paths
+        candidates = []
+
+        if system == "Windows":
+            base_paths = [
+                r"C:\Program Files\Blender Foundation",
+                r"C:\Program Files (x86)\Blender Foundation",
+            ]
+            for base in base_paths:
+                # Generate versions 4.0-5.3
+                for major in [4, 5]:
+                    for minor in range(10):
+                        version = f"{major}.{minor}"
+                        candidates.append(
+                            os.path.join(base, f"Blender {version}", "blender.exe")
+                        )
+
+            # AppData and home directory
+            appdata = os.getenv("APPDATA")
+            if appdata:
+                candidates.append(os.path.join(appdata, "Blender", "blender.exe"))
+
+            home = os.path.expanduser("~")
+            candidates.extend([
+                os.path.join(home, "Blender", "blender.exe"),
+                os.path.join(home, "Documents", "Blender", "blender.exe"),
+            ])
+
+        elif system == "Darwin":  # macOS
+            candidates.extend([
+                "/Applications/Blender.app/Contents/MacOS/Blender",
+                os.path.expanduser("~/Applications/Blender.app/Contents/MacOS/Blender"),
+                "/opt/homebrew/bin/blender",
+                "/usr/local/bin/blender",
+            ])
+
+        elif system == "Linux":
+            candidates.extend([
+                "/usr/bin/blender",
+                "/usr/local/bin/blender",
+                "/opt/blender/blender",
+                "/snap/bin/blender",
+                os.path.expanduser("~/blender/blender"),
+            ])
+
+        # Try all candidates
+        for candidate in candidates:
+            try:
+                if candidate and os.path.exists(candidate):
+                    if os.access(candidate, os.X_OK):
+                        print(f"[Server] Found Blender: {candidate}")
+                        return candidate
+            except Exception:
+                continue
+
+        print("[Server] ERROR: Blender not found. Checked:")
+        print("  - PATH via shutil.which()")
+        if system == "Windows":
+            print("  - Windows registry")
+            print("  - C:\\Program Files\\Blender Foundation\\Blender *.*")
+            print("  - C:\\Program Files (x86)\\Blender Foundation\\Blender *.*")
+        elif system == "Darwin":
+            print("  - /Applications/Blender.app")
+            print("  - /opt/homebrew/bin/blender")
+            print("  - /usr/local/bin/blender")
+        elif system == "Linux":
+            print("  - /usr/bin/blender")
+            print("  - /usr/local/bin/blender")
+            print("  - /opt/blender/blender")
+            print("  - /snap/bin/blender")
+
         return None
 
     async def _send_error(self, ws, message):
