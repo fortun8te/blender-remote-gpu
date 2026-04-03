@@ -210,14 +210,8 @@ class REMOTEGPU_PT_panel(bpy.types.Panel):
         layout = self.layout
 
         # Version header
-        try:
-            from . import BUILD, BUILD_DATE, __version__
-            header_box = layout.box()
-            row = header_box.row(align=True)
-            row.label(text=f"Remote GPU {BUILD} ({BUILD_DATE})", icon="RENDER_RESULT")
-            row.label(text=__version__)
-        except ImportError:
-            pass
+        header_box = layout.box()
+        header_box.label(text="Remote GPU Addon v1.0.4 (b4)", icon="RENDER_RESULT")
 
         # Get preferences
         try:
