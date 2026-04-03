@@ -1,16 +1,14 @@
 """Remote GPU render engine — F12 renders on the remote RTX GPU.
 
-b25: viewport rendering moved to live_preview.py (dual-viewport architecture).
-This engine handles F12 (Render Image) only.
+AGENT R3: Migrated to stateless job dispatcher API.
+  Mac saves .blend → dispatcher queues job → RTX 5080 renders → PNG back
 
-When you hit F12:
-  Mac saves .blend → uploads to Windows → RTX 5080 renders with OptiX → PNG back
+Previously: persistent worker connection (now replaced by dispatcher)
 """
 
 import bpy
 import os
 import time
-import base64
 import tempfile
 
 
@@ -19,10 +17,8 @@ class RemoteRenderEngine(bpy.types.RenderEngine):
     bl_label = "Remote GPU"
     bl_use_preview = False
 
-    # Shared connection state (used by operators + live_preview)
-    _connection = None
-    _scene_id = None
-    _scene_uploaded = False
+    # Dispatcher client (stateless, created per-render)
+    _dispatcher = None
 
     def __init__(self):
         pass
@@ -33,9 +29,10 @@ class RemoteRenderEngine(bpy.types.RenderEngine):
     # ── F12 FINAL RENDER ──────────────────────────────────────
 
     def render(self, depsgraph):
-        conn = RemoteRenderEngine._connection
-        if not conn or not conn.connected:
-            self.report({"ERROR"}, "Not connected. Click Connect first.")
+        """Submit render job to dispatcher, poll status, fetch result."""
+        dispatcher = RemoteRenderEngine._dispatcher
+        if not dispatcher:
+            self.report({"ERROR"}, "Not connected to dispatcher. Click Connect first.")
             return
 
         scene = depsgraph.scene
@@ -49,32 +46,29 @@ class RemoteRenderEngine(bpy.types.RenderEngine):
         self.update_stats("", "Saving scene...")
         self.update_progress(0.0)
 
-        blend_b64 = self._save_scene_b64()
-        if not blend_b64:
+        blend_path = self._save_scene_temp()
+        if not blend_path:
             self.report({"ERROR"}, "Failed to save scene")
             return
 
         if self.test_break():
             return
 
-        size_kb = len(blend_b64) * 3 // 4 // 1024
-        self.update_stats("", f"Uploading scene ({size_kb} KB)...")
-        self.update_progress(0.1)
+        # Build scene path for dispatcher (assumes network path or mounted filesystem)
+        # For now, use local path — adjust if dispatcher runs on different machine
+        scene_path = blend_path
+        size_kb = os.path.getsize(blend_path) // 1024
+        self.update_stats("", f"Submitting render ({size_kb} KB)...")
+        self.update_progress(0.15)
 
-        # Upload scene and cache it (reused for live preview too)
-        scene_id = conn.upload_scene(blend_b64)
-        if not scene_id:
-            job_id = conn.submit_render(blend_b64, width, height, samples)
-        else:
-            RemoteRenderEngine._scene_id = scene_id
-            RemoteRenderEngine._scene_uploaded = True
-            job_id = conn.submit_render_cached(scene_id, width, height, samples)
-
-        if not job_id:
-            self.report({"ERROR"}, "Failed to submit render job")
+        # Submit job to dispatcher
+        job_result = dispatcher.submit_render_job(scene_path, width, height, samples)
+        if not job_result or not job_result.get("job_id"):
+            self.report({"ERROR"}, "Failed to submit render job to dispatcher")
             return
 
-        self.update_stats("", f"Rendering on {conn.gpu_name} ({samples} samples)...")
+        job_id = job_result["job_id"]
+        self.update_stats("", f"Job {job_id[:8]}... queued ({samples} samples)...")
         self.update_progress(0.2)
 
         # Poll until complete
@@ -83,25 +77,29 @@ class RemoteRenderEngine(bpy.types.RenderEngine):
             if self.test_break():
                 return
 
-            status = conn.poll_status(job_id)
-            if not status:
-                self.report({"ERROR"}, "Lost connection to server")
+            status_result = dispatcher.get_job_status(job_id)
+            if not status_result:
+                self.report({"ERROR"}, "Lost connection to dispatcher")
                 return
 
-            job_status = status.get("status", "unknown")
+            job_status = status_result.get("status", "unknown")
+            progress_value = status_result.get("progress", 0.0)
             elapsed = time.time() - start_time
 
-            if job_status == "complete":
+            if job_status == "done":
                 self.update_progress(0.9)
                 break
             elif job_status == "error":
-                self.report({"ERROR"}, f"Render failed: {status.get('error')}")
+                error_msg = status_result.get("error", "Unknown error")
+                self.report({"ERROR"}, f"Render failed: {error_msg}")
                 return
-            elif job_status in ("queued", "rendering"):
-                progress = min(0.2 + (elapsed / 300.0) * 0.7, 0.85)
-                self.update_progress(progress)
+            elif job_status in ("queued", "running"):
+                # Map dispatcher progress (0.0-1.0) to Blender's UI range (0.2-0.85)
+                ui_progress = 0.2 + (progress_value * 0.65)
+                self.update_progress(ui_progress)
                 m, s = divmod(int(elapsed), 60)
-                self.update_stats("", f"Rendering on {conn.gpu_name}... {m}m {s}s")
+                msg = status_result.get("message", job_status)
+                self.update_stats("", f"{msg}... {m}m {s}s")
                 time.sleep(1.0)
             else:
                 self.report({"ERROR"}, f"Unexpected status: {job_status}")
@@ -111,31 +109,59 @@ class RemoteRenderEngine(bpy.types.RenderEngine):
                 self.report({"ERROR"}, "Timed out after 10 minutes")
                 return
 
-        # Fetch result and display in Blender's render window
-        result_data = conn.get_result(job_id)
-        if not result_data or not result_data.get("png_b64"):
+        # Fetch result from dispatcher
+        result_data = dispatcher.get_job_result(job_id)
+        if not result_data:
+            self.report({"ERROR"}, "Failed to fetch render result")
+            return
+
+        if result_data.get("status") != "success":
+            error_msg = result_data.get("error", "Unknown error")
+            self.report({"ERROR"}, f"Render result error: {error_msg}")
+            return
+
+        # Dispatcher returns image_path on its machine — fetch PNG file
+        result_image_path = result_data.get("image_path")
+        if not result_image_path:
+            self.report({"ERROR"}, "No image path in result")
+            return
+
+        # Read PNG from dispatcher's result
+        try:
+            png_bytes = self._fetch_result_png(result_image_path)
+        except Exception as e:
+            self.report({"ERROR"}, f"Failed to fetch PNG: {e}")
+            return
+
+        if not png_bytes:
             self.report({"ERROR"}, "Empty render result")
             return
 
-        png_bytes = base64.b64decode(result_data["png_b64"])
         self._display_png(png_bytes, width, height, start_time)
 
-    def _save_scene_b64(self):
-        """Save current Blender scene to temp .blend and return as base64."""
+    def _save_scene_temp(self):
+        """Save current Blender scene to temp .blend file. Returns path (or None on error)."""
         tmp = tempfile.NamedTemporaryFile(suffix=".blend", delete=False)
         tmp.close()
         try:
             bpy.ops.wm.save_as_mainfile(filepath=tmp.name, copy=True)
-            with open(tmp.name, "rb") as f:
-                return base64.b64encode(f.read()).decode("ascii")
+            return tmp.name
         except Exception as e:
             print(f"[RemoteGPU] Scene save failed: {e}")
-            return None
-        finally:
             try:
                 os.unlink(tmp.name)
             except Exception:
                 pass
+            return None
+
+    def _fetch_result_png(self, image_path):
+        """Fetch PNG result from dispatcher's image_path.
+
+        For now, assumes the path is accessible (local or mounted filesystem).
+        In future, could support HTTP fetch or dispatcher streaming.
+        """
+        with open(image_path, "rb") as f:
+            return f.read()
 
     def _display_png(self, png_bytes, width, height, start_time):
         """Decode PNG result and push into Blender's render result buffer."""

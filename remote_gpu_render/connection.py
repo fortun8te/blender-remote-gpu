@@ -1,8 +1,7 @@
-"""HTTP client for render server b24.
+"""HTTP clients for remote render systems.
 
-b24 additions:
-- viewport_render() now accepts samples parameter (for progressive rendering)
-- update_camera() — lightweight camera-only update, no render
+LEGACY: Connection class (persistent worker) — deprecated in favor of JobDispatcherClient
+NEW: JobDispatcherClient — stateless job dispatcher API (Agent R3)
 
 Connection methods tried in order (all Python builtins, zero external deps):
 1. urllib.request (HTTP POST)
@@ -14,6 +13,8 @@ Connection methods tried in order (all Python builtins, zero external deps):
 import json
 import time
 import base64
+import urllib.request
+import urllib.error
 
 
 class Connection:
@@ -254,3 +255,121 @@ class Connection:
             "type": "viewport_poll",
             "scene_id": scene_id,
         })
+
+
+# ============================================================================
+# AGENT R3: Job Dispatcher Client (stateless API)
+# ============================================================================
+
+class JobDispatcherClient:
+    """Stateless HTTP client for job dispatcher.
+
+    Replaces persistent worker connection. Each render operation is a job:
+    1. POST /render_job (submit render)
+    2. GET /job_status/{job_id} (poll progress)
+    3. GET /job_result/{job_id} (fetch PNG)
+
+    Scene is sent with each job (no caching).
+    """
+
+    def __init__(self, server_ip, server_port=9876):
+        self.host = server_ip
+        self.port = int(server_port)
+        self.base_url = f"http://{server_ip}:{server_port}"
+        self.latency_ms = 0
+        self.error = ""
+
+    def _http_post(self, endpoint, payload, timeout=30):
+        """POST JSON to endpoint, return parsed response."""
+        url = f"{self.base_url}{endpoint}"
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            start = time.time()
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+            self.latency_ms = int((time.time() - start) * 1000)
+            self.error = ""
+            return result
+        except urllib.error.URLError as e:
+            self.error = str(e)
+            return None
+        except Exception as e:
+            self.error = str(e)
+            return None
+
+    def _http_get(self, endpoint, timeout=30):
+        """GET from endpoint, return parsed response."""
+        url = f"{self.base_url}{endpoint}"
+        req = urllib.request.Request(url, method="GET")
+        try:
+            start = time.time()
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+            self.latency_ms = int((time.time() - start) * 1000)
+            self.error = ""
+            return result
+        except urllib.error.URLError as e:
+            self.error = str(e)
+            return None
+        except Exception as e:
+            self.error = str(e)
+            return None
+
+    def ping(self):
+        """Test connectivity to dispatcher. Returns True if reachable."""
+        result = self._http_get("/health", timeout=5)
+        return result is not None and result.get("status") == "ok"
+
+    def submit_render_job(self, scene_path, width, height, samples):
+        """Submit a render job to the dispatcher.
+
+        Args:
+            scene_path: Full path to .blend file on dispatcher machine
+            width: Output image width
+            height: Output image height
+            samples: Cycles samples
+
+        Returns:
+            {"job_id": "uuid", "status": "queued"} or None on error
+        """
+        payload = {
+            "scene_path": scene_path,
+            "width": width,
+            "height": height,
+            "samples": samples,
+        }
+        result = self._http_post("/render_job", payload, timeout=30)
+        if result and result.get("status") == "queued":
+            return result
+        return None
+
+    def get_job_status(self, job_id):
+        """Poll job status.
+
+        Returns:
+            {
+              "status": "queued|running|done|error",
+              "progress": 0.5,  # 0.0 to 1.0
+              "message": "...",  # optional
+              "error": "..."  # if status == "error"
+            }
+        """
+        return self._http_get(f"/job_status/{job_id}", timeout=5)
+
+    def get_job_result(self, job_id):
+        """Fetch completed job result.
+
+        Returns:
+            {
+              "status": "success|error",
+              "image_path": "/path/to/render.png",  # on dispatcher machine
+              "file_size": 1024,
+              "error": "..."  # if status == "error"
+            }
+        """
+        return self._http_get(f"/job_result/{job_id}", timeout=30)

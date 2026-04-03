@@ -84,8 +84,8 @@ class REMOTEGPU_OT_auto_discover(bpy.types.Operator):
 
 class REMOTEGPU_OT_connect(bpy.types.Operator):
     bl_idname = "remotegpu.connect"
-    bl_label = "Connect"
-    bl_description = "Connect to the remote GPU render server"
+    bl_label = "Connect to Dispatcher"
+    bl_description = "Connect to the job dispatcher"
 
     _timer = None
     _thread = None
@@ -98,25 +98,23 @@ class REMOTEGPU_OT_connect(bpy.types.Operator):
             print(f"[RemoteGPU] ERROR: preferences not found. __package__={__package__}")
             return {"CANCELLED"}
 
-        # Close existing
-        if engine.RemoteRenderEngine._connection:
-            engine.RemoteRenderEngine._connection.close()
-            engine.RemoteRenderEngine._connection = None
+        # Clear old dispatcher
+        engine.RemoteRenderEngine._dispatcher = None
 
         ip = prefs.server_ip
         port = prefs.server_port
-        self.report({"INFO"}, f"Connecting to {ip}:{port}...")
+        self.report({"INFO"}, f"Connecting to dispatcher {ip}:{port}...")
 
-        # Run connection in background thread
-        from .connection import Connection
-        conn = Connection(ip, port)
+        # Test connection in background thread
+        from .connection import JobDispatcherClient
+        dispatcher = JobDispatcherClient(ip, port)
 
-        def _connect():
-            conn.connect()
-            REMOTEGPU_OT_connect._result = conn
+        def _test_ping():
+            result = dispatcher.ping()
+            REMOTEGPU_OT_connect._result = (result, dispatcher)
 
         REMOTEGPU_OT_connect._result = None
-        REMOTEGPU_OT_connect._thread = threading.Thread(target=_connect, daemon=True)
+        REMOTEGPU_OT_connect._thread = threading.Thread(target=_test_ping, daemon=True)
         REMOTEGPU_OT_connect._thread.start()
 
         # Register timer to check when done
@@ -130,18 +128,20 @@ class REMOTEGPU_OT_connect(bpy.types.Operator):
 
         thread = REMOTEGPU_OT_connect._thread
         if thread and thread.is_alive():
-            return {"PASS_THROUGH"}  # Still connecting
+            return {"PASS_THROUGH"}  # Still testing
 
         # Done
         context.window_manager.event_timer_remove(self._timer)
 
-        conn = REMOTEGPU_OT_connect._result
-        if conn and conn.connected:
-            engine.RemoteRenderEngine._connection = conn
-            self.report({"INFO"}, f"Connected — {conn.gpu_name} via {conn.method}")
+        result = REMOTEGPU_OT_connect._result
+        if result and result[0]:
+            dispatcher = result[1]
+            engine.RemoteRenderEngine._dispatcher = dispatcher
+            self.report({"INFO"}, f"Connected to dispatcher ({dispatcher.latency_ms}ms)")
         else:
-            error = conn.error if conn else "Unknown error"
-            self.report({"ERROR"}, f"Connection failed: {error}")
+            dispatcher = result[1] if result else None
+            error = dispatcher.error if dispatcher else "Unknown error"
+            self.report({"ERROR"}, f"Dispatcher unreachable: {error}")
 
         # Redraw UI
         for area in context.screen.areas:
@@ -153,7 +153,7 @@ class REMOTEGPU_OT_connect(bpy.types.Operator):
 class REMOTEGPU_OT_disconnect(bpy.types.Operator):
     bl_idname = "remotegpu.disconnect"
     bl_label = "Disconnect"
-    bl_description = "Disconnect from the render server"
+    bl_description = "Disconnect from the dispatcher"
 
     def execute(self, context):
         # Stop live preview first
@@ -164,16 +164,10 @@ class REMOTEGPU_OT_disconnect(bpy.types.Operator):
         except Exception:
             pass
 
-        conn = engine.RemoteRenderEngine._connection
-        if conn:
-            conn.close()
-            engine.RemoteRenderEngine._connection = None
+        # Clear dispatcher
+        engine.RemoteRenderEngine._dispatcher = None
 
-        # Clear scene state so stale IDs don't persist across reconnects
-        engine.RemoteRenderEngine._scene_id = None
-        engine.RemoteRenderEngine._scene_uploaded = False
-
-        self.report({"INFO"}, "Disconnected")
+        self.report({"INFO"}, "Disconnected from dispatcher")
         for area in context.screen.areas:
             area.tag_redraw()
         return {"FINISHED"}
@@ -181,8 +175,8 @@ class REMOTEGPU_OT_disconnect(bpy.types.Operator):
 
 class REMOTEGPU_OT_test_connection(bpy.types.Operator):
     bl_idname = "remotegpu.test_connection"
-    bl_label = "Test Connection"
-    bl_description = "Test if the server is reachable"
+    bl_label = "Test Dispatcher"
+    bl_description = "Test if the dispatcher is reachable"
 
     _timer = None
     _thread = None
@@ -197,14 +191,14 @@ class REMOTEGPU_OT_test_connection(bpy.types.Operator):
 
         ip = prefs.server_ip
         port = prefs.server_port
-        self.report({"INFO"}, f"Testing {ip}:{port}...")
+        self.report({"INFO"}, f"Testing dispatcher {ip}:{port}...")
 
-        from .connection import Connection
-        conn = Connection(ip, port)
+        from .connection import JobDispatcherClient
+        dispatcher = JobDispatcherClient(ip, port)
 
         def _test():
-            conn.connect()
-            REMOTEGPU_OT_test_connection._result = conn
+            result = dispatcher.ping()
+            REMOTEGPU_OT_test_connection._result = (result, dispatcher)
 
         REMOTEGPU_OT_test_connection._result = None
         REMOTEGPU_OT_test_connection._thread = threading.Thread(target=_test, daemon=True)
@@ -224,17 +218,14 @@ class REMOTEGPU_OT_test_connection(bpy.types.Operator):
 
         context.window_manager.event_timer_remove(self._timer)
 
-        conn = REMOTEGPU_OT_test_connection._result
-        if conn and conn.connected:
-            self.report({"INFO"},
-                f"Server reachable — {conn.gpu_name}, {conn.vram_free}MB VRAM, "
-                f"{conn.latency_ms}ms via {conn.method}")
+        result = REMOTEGPU_OT_test_connection._result
+        if result and result[0]:
+            dispatcher = result[1]
+            self.report({"INFO"}, f"Dispatcher reachable ({dispatcher.latency_ms}ms)")
         else:
-            error = conn.error if conn else "Unknown error"
-            self.report({"ERROR"}, f"Cannot reach server: {error}")
-
-        if conn:
-            conn.close()
+            dispatcher = result[1] if result else None
+            error = dispatcher.error if dispatcher else "Unknown error"
+            self.report({"ERROR"}, f"Cannot reach dispatcher: {error}")
 
         for area in context.screen.areas:
             area.tag_redraw()

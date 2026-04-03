@@ -81,27 +81,25 @@ class REMOTEGPU_PT_render_panel(bpy.types.Panel):
         prefs = addon.preferences
 
         box = layout.box()
-        box.label(text="Server", icon="URL")
+        box.label(text="Dispatcher", icon="URL")
         row = box.row(align=True)
         row.prop(prefs, "server_ip", text="IP")
         row.prop(prefs, "server_port", text="Port")
 
-        conn = engine.RemoteRenderEngine._connection
+        dispatcher = engine.RemoteRenderEngine._dispatcher
 
-        if conn and conn.connected:
+        if dispatcher is not None:
             s = layout.box()
-            s.label(text=f"CONNECTED — {conn.gpu_name}", icon="CHECKMARK")
-            s.label(text=f"Latency: {conn.latency_ms}ms ({conn.method})")
+            s.label(text="CONNECTED", icon="CHECKMARK")
+            s.label(text=f"Latency: {dispatcher.latency_ms}ms")
             s.operator("remotegpu.disconnect", text="Disconnect", icon="CANCEL")
         else:
             s = layout.box()
             s.label(text="NOT CONNECTED", icon="ERROR")
-            if conn and conn.error:
-                s.label(text=conn.error)
             col = s.column(align=True)
             col.scale_y = 1.5
-            col.operator("remotegpu.connect", text="Connect to Server", icon="URL")
-            col.operator("remotegpu.test_connection", text="Test Connection", icon="FILE_REFRESH")
+            col.operator("remotegpu.connect", text="Connect to Dispatcher", icon="URL")
+            col.operator("remotegpu.test_connection", text="Test Dispatcher", icon="FILE_REFRESH")
 
 
 # ── Panel: N-Panel Sidebar ────────────────────────────────────────────────────
@@ -124,22 +122,18 @@ class REMOTEGPU_PT_sidebar(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
 
-        conn = engine.RemoteRenderEngine._connection
-        scene_uploaded = engine.RemoteRenderEngine._scene_uploaded
+        dispatcher = engine.RemoteRenderEngine._dispatcher
 
         # ── Connection ────────────────────────────────────────
         box = layout.box()
-        box.label(text="Connection", icon="URL")
+        box.label(text="Dispatcher", icon="URL")
 
-        if conn and conn.connected:
+        if dispatcher is not None:
             row = box.row()
-            row.label(text=conn.gpu_name, icon="CHECKMARK")
-            box.label(text=f"{conn.latency_ms}ms  {conn.method}")
+            row.label(text="Connected", icon="CHECKMARK")
+            box.label(text=f"{dispatcher.latency_ms}ms")
             box.operator("remotegpu.disconnect", text="Disconnect", icon="X")
         else:
-            if conn and conn.error:
-                box.label(text=conn.error, icon="ERROR")
-
             col = box.column(align=True)
             col.scale_y = 1.5
             col.operator("remotegpu.auto_discover",
@@ -148,22 +142,6 @@ class REMOTEGPU_PT_sidebar(bpy.types.Panel):
             col.scale_y = 1.0
             col.operator("remotegpu.connect", text="Connect manually", icon="PLAY")
             col.operator("remotegpu.test_connection", text="Test", icon="FILE_REFRESH")
-
-        # ── Scene ─────────────────────────────────────────────
-        box = layout.box()
-        box.label(text="Scene", icon="SCENE_DATA")
-
-        if scene_uploaded:
-            box.label(text="Scene in GPU memory", icon="CHECKMARK")
-        else:
-            box.label(text="Not uploaded", icon="ERROR")
-
-        row = box.row()
-        row.scale_y = 1.2
-        row.enabled = (conn is not None and conn.connected)
-        row.operator("remotegpu.upload_scene",
-                     text="Upload Scene" if not scene_uploaded else "Re-upload Scene",
-                     icon="EXPORT")
 
         # ── Live Preview ──────────────────────────────────────
         box = layout.box()
@@ -291,9 +269,8 @@ def unregister():
     if _HAS_LIVE_PREVIEW and live_preview and live_preview.is_active():
         live_preview.stop_preview()
 
-    if engine.RemoteRenderEngine._connection:
-        engine.RemoteRenderEngine._connection.close()
-        engine.RemoteRenderEngine._connection = None
+    # Clear dispatcher reference
+    engine.RemoteRenderEngine._dispatcher = None
 
     for panel in _get_compatible_panels():
         panel.COMPAT_ENGINES.discard("REMOTE_GPU")
