@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """
-Persistent Blender Render Worker b34 — runs INSIDE Blender, keeps scene in GPU memory.
+Persistent Blender Render Worker b35 — runs INSIDE Blender, keeps scene in GPU memory.
 
 Launch: blender --background --python render_worker.py
 
-b34: TESTED AND PROVEN locally on Blender 5.0:
-  - while True main loop (required — script must NOT return in --background mode)
-  - HTTP handler queues path via global + lock
-  - Main loop calls open_mainfile safely on main thread
-  - HTTP daemon thread survives open_mainfile
-  - Ping returns scene_loaded=true after load completes
+b35: Fix scene load blocking + improve state management:
+  - Atomic state reads in ping (prevents race conditions)
+  - Detailed load logging ([LOAD_*] prefixes for diagnosing hangs)
+  - Blender window event pumping (unblocks bpy.ops.wm.open_mainfile)
+  - Reduced sleep interval for responsive state updates
 """
 
 import sys
