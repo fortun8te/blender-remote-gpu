@@ -91,6 +91,11 @@ def start_worker():
 
     env = os.environ.copy()
     env["WORKER_PORT"] = str(WORKER_PORT)
+    # Add user site-packages to PYTHONPATH for Blender (workaround for isolated Python)
+    user_site = os.path.expanduser(r"~\AppData\Roaming\Python\Python311\site-packages")
+    if os.path.exists(user_site):
+        existing = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = user_site + (";" + existing if existing else "")
 
     log.info(f"Starting persistent Blender worker...")
     worker_process = subprocess.Popen(
@@ -243,20 +248,44 @@ def handle_message(data):
 
             if result.get("type") in ("scene_loading", "scene_loaded"):
                 log.info("Scene queued on worker — polling until loaded...")
-                was_loading = False
-                for attempt in range(240):   # up to 120 seconds
-                    time.sleep(0.5)
+                start_time = time.time()
+                last_state = None
+                consecutive_errors = 0
+                max_wait = 120  # seconds
+
+                for attempt in range(int(max_wait * 10)):  # up to 120 seconds with 0.1s granularity
+                    time.sleep(0.1)
                     ping = send_to_worker({"type": "ping"}, timeout=5)
-                    if ping and ping.get("scene_loaded"):
-                        log.info(f"Worker scene ready (took ~{attempt * 0.5:.1f}s)")
+
+                    if not ping:
+                        consecutive_errors += 1
+                        if consecutive_errors > 10:  # 1 second of failed pings
+                            log.error("Worker lost connectivity during scene load")
+                            return {"type": "error", "message": "Worker lost connectivity"}
+                        continue
+                    consecutive_errors = 0
+
+                    scene_loaded = ping.get("scene_loaded", False)
+                    scene_loading = ping.get("scene_loading", False)
+                    current_state = (scene_loading, scene_loaded)
+
+                    # Log state changes
+                    if current_state != last_state:
+                        elapsed = time.time() - start_time
+                        log.info(f"[{elapsed:.1f}s] scene_loading={scene_loading}, scene_loaded={scene_loaded}")
+                        last_state = current_state
+
+                    if scene_loaded:
+                        elapsed = time.time() - start_time
+                        log.info(f"Worker scene ready ({elapsed:.1f}s)")
                         return {"type": "scene_cached", "scene_id": "worker", "objects": 0}
-                    # Detect failed load early: was loading, now stopped but not loaded
-                    if ping and ping.get("scene_loading"):
-                        was_loading = True
-                    elif was_loading and ping and not ping.get("scene_loading") and not ping.get("scene_loaded"):
-                        log.error("Worker load failed (scene_loading went false without scene_loaded)")
-                        return {"type": "error", "message": "Worker failed to load scene — check Blender console"}
-                return {"type": "error", "message": "Worker scene load timed out (120s)"}
+
+                    # Detect failed load early: state stopped changing and load failed
+                    if not scene_loading and not scene_loaded and last_state and last_state[0]:
+                        log.error("Worker load failed (scene_loading→False without scene_loaded→True)")
+                        return {"type": "error", "message": "Worker failed to load scene — check Blender logs"}
+
+                return {"type": "error", "message": f"Worker scene load timed out ({max_wait}s)"}
 
             return result  # pass through any error
         else:

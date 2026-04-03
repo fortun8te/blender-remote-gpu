@@ -12,10 +12,17 @@ b34: TESTED AND PROVEN locally on Blender 5.0:
   - Ping returns scene_loaded=true after load completes
 """
 
+import sys
+import os
+
+# Add user site-packages to path (workaround for Blender's isolated Python)
+user_site = os.path.expanduser(r"~\AppData\Roaming\Python\Python311\site-packages")
+if os.path.exists(user_site) and user_site not in sys.path:
+    sys.path.insert(0, user_site)
+
 import bpy
 import json
 import base64
-import os
 import tempfile
 import time
 import threading
@@ -151,15 +158,25 @@ class WorkerHandler(BaseHTTPRequestHandler):
             response = {}
 
             if msg_type == "ping":
+                # Read all state atomically
+                with _render_lock:
+                    loaded = _scene_loaded
+                    loading = _scene_loading
+                    rendering = _rendering
+                    compute = _compute_type
+
                 response = {
                     "type":          "pong",
                     "worker":        True,
-                    "build":         "b34",
-                    "scene_loaded":  _scene_loaded,
-                    "scene_loading": _scene_loading,
-                    "rendering":     _rendering,
-                    "compute":       _compute_type,
+                    "build":         "b35",
+                    "scene_loaded":  loaded,
+                    "scene_loading": loading,
+                    "rendering":     rendering,
+                    "compute":       compute,
                 }
+                # Detailed logging for scene load polling (helps server diagnose hangs)
+                if loading or loaded:
+                    _log(f"[PING] scene_loading={loading}, scene_loaded={loaded}, rendering={rendering}")
 
             elif msg_type == "load_scene_path":
                 blend_path = data.get("path", "")
@@ -289,7 +306,7 @@ def main():
     setup_gpu()
 
     _log("=" * 55)
-    _log(f"Blender Render Worker b34 on port {WORKER_PORT}")
+    _log(f"Blender Render Worker b35 on port {WORKER_PORT}")
     _log(f"Blender {bpy.app.version_string}")
     _log(f"Compute: {_compute_type}")
     _log("=" * 55)
@@ -307,22 +324,44 @@ def main():
                 _pending_path = None
 
             if path:
-                _scene_loading = True
-                _scene_loaded  = False
-                _log(f"Main thread loading: {path}")
+                _log(f"[LOAD_START] Path: {path}")
+                with _render_lock:
+                    # Set state ATOMICALLY: both flags together
+                    _scene_loading = True
+                    _scene_loaded  = False
+                _log(f"[LOAD_STATE] scene_loading=True, scene_loaded=False")
+
                 try:
-                    bpy.ops.wm.open_mainfile(filepath=path)
+                    _log(f"[LOAD_MAINFILE_START] Calling open_mainfile")
+                    # Override context to main window
+                    with bpy.context.temp_override(window=bpy.context.window or bpy.context.window_manager.windows[0] if bpy.context.window_manager.windows else None):
+                        bpy.ops.wm.open_mainfile(filepath=path)
+                    _log(f"[LOAD_MAINFILE_OK] File opened successfully")
+
+                    _log(f"[LOAD_GPU_SETUP_START] Re-initializing GPU")
                     setup_gpu()
-                    _scene_loaded = True
-                    _log(f"Scene ready: {len(bpy.data.objects)} objects, compute={_compute_type}")
+                    _log(f"[LOAD_GPU_SETUP_OK] Compute: {_compute_type}")
+
+                    obj_count = len(bpy.data.objects)
+                    _log(f"[LOAD_OBJECTS] Loaded {obj_count} objects")
+
+                    # Set scene_loaded ONLY after all steps succeed
+                    with _render_lock:
+                        _scene_loaded = True
+                    _log(f"[LOAD_COMPLETE] Scene ready: {obj_count} objects, compute={_compute_type}")
+
                 except Exception as e:
-                    _log(f"open_mainfile failed: {e}")
+                    _log(f"[LOAD_ERROR] open_mainfile failed: {type(e).__name__}: {e}")
+                    with _render_lock:
+                        _scene_loaded = False
                 finally:
-                    _scene_loading = False
+                    with _render_lock:
+                        _scene_loading = False
+                    _log(f"[LOAD_DONE] scene_loading=False")
 
                 # Restart HTTP if open_mainfile killed the thread
                 if not http_thread.is_alive():
-                    _log("HTTP thread died — restarting")
+                    _log("[HTTP_RESTART] HTTP thread died — restarting")
                     try:
                         server.shutdown()
                     except Exception:
@@ -330,9 +369,16 @@ def main():
                     server = HTTPServer(("0.0.0.0", WORKER_PORT), WorkerHandler)
                     http_thread = threading.Thread(target=server.serve_forever, daemon=True)
                     http_thread.start()
-                    _log("HTTP restarted")
+                    _log("[HTTP_RESTART_OK] HTTP restarted")
 
-            time.sleep(0.1)
+            # Pump Blender window events (non-blocking)
+            try:
+                for _ in range(10):  # Process up to 10 pending events
+                    bpy.ops.wm.redraw_timer_execute()
+            except Exception:
+                pass
+
+            time.sleep(0.05)  # Reduced sleep for more responsive event pumping
 
     except KeyboardInterrupt:
         _log("Shutting down")
