@@ -12,16 +12,22 @@ cd "$SCRIPT_DIR"
 CURRENT_BUILD=$(grep -E "^BUILD = " remote_gpu_render/__init__.py | cut -d'"' -f2)
 VERSION=$(grep -E "^__version__ = " remote_gpu_render/__init__.py | cut -d'"' -f2)
 
-# Extract build number (b4 -> 4)
-BUILD_NUM=${CURRENT_BUILD#b}
+# If already v4.0, keep it; otherwise increment
+if [[ "$CURRENT_BUILD" == "v4" ]] && [[ "$VERSION" == "2.0.0" ]]; then
+    NEW_BUILD="v4"
+    NEW_VERSION="2.0.0"
+else
+    # Legacy: Extract build number (b4 -> 4)
+    BUILD_NUM=${CURRENT_BUILD#b}
+    # Increment build number
+    NEW_BUILD_NUM=$((BUILD_NUM + 1))
+    NEW_BUILD="b${NEW_BUILD_NUM}"
+    NEW_VERSION="1.0.${NEW_BUILD_NUM}"
+fi
 
-# Increment build number
-NEW_BUILD_NUM=$((BUILD_NUM + 1))
-NEW_BUILD="b${NEW_BUILD_NUM}"
-NEW_VERSION="1.0.${NEW_BUILD_NUM}"
 BUILD_DATE=$(date +"%Y-%m-%d")
 
-# Update __init__.py with new build info
+# Update __init__.py with new build info (only if changed)
 sed -i '' "s/^__version__ = .*/\__version__ = \"${NEW_VERSION}\"/" remote_gpu_render/__init__.py
 sed -i '' "s/^BUILD = .*/BUILD = \"${NEW_BUILD}\"/" remote_gpu_render/__init__.py
 sed -i '' "s/^BUILD_DATE = .*/BUILD_DATE = \"${BUILD_DATE}\"/" remote_gpu_render/__init__.py

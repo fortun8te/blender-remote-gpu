@@ -1,12 +1,16 @@
 """Remote GPU Render — offload Cycles rendering to a remote GPU over HTTP.
 
-b29: Added importlib.reload() pattern so re-installing without a Blender
-     restart works correctly (fixes stale sys.modules cache errors).
-     Panel classes stay in __init__.py (b28 fix for Blender 5.0 metaclass).
+v4.0: COMPLETE REWRITE — Dispatcher architecture (R1-R4 agents)
+  - Eliminated "Loading on main thread" error via async dispatcher
+  - Job queue with worker pool architecture
+  - Full HTTP API: /submit, /job_status, /job_result, /health
+  - Blender addon connects to dispatcher instead of worker
+  - All Python files compile without error
+  - Comprehensive test plan and deployment guide included
 """
 
-__version__ = "1.0.37"
-BUILD = "b37"
+__version__ = "2.0.0"
+BUILD = "v4"
 BUILD_DATE = "2026-04-03"
 
 bl_info = {
