@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """
-Persistent Blender Render Worker b31 — runs INSIDE Blender, keeps scene in GPU memory.
+Persistent Blender Render Worker b32 — runs INSIDE Blender, keeps scene in GPU memory.
 
 Launch: blender --background --python render_worker.py
 
-b31 fix: open_mainfile MUST run on Blender's main thread.
-  Calling it from the HTTP handler thread kills the Python runtime → WinError 10054.
-  Fix: HTTP handler saves blend to disk + queues a timer, returns "scene_loading"
-       immediately. Main thread timer calls open_mainfile. server.py polls ping
-       until scene_loaded=True before returning scene_cached to Mac.
+b32: open_mainfile runs directly in the main loop (not via bpy.app.timers,
+     which don't fire in --background mode). HTTP handler sets a pending path,
+     main loop picks it up and calls open_mainfile on the main thread.
 """
 
 import bpy
@@ -25,16 +23,15 @@ WORKER_PORT = int(os.environ.get("WORKER_PORT", "9880"))
 
 _scene_loaded   = False
 _scene_path     = ""
-_scene_loading  = False   # True while open_mainfile is in progress
+_scene_loading  = False
 _last_render_b64 = ""
 _rendering      = False
 _render_lock    = threading.Lock()
 
-# Pending blend file path — set by HTTP thread, consumed by main-thread timer
+# Pending blend file path — set by HTTP thread, consumed by main loop
 _pending_load_path = None
 _pending_load_lock = threading.Lock()
 
-# Which compute type is active ("OPTIX", "CUDA", "NONE")
 _compute_type = "NONE"
 
 
@@ -74,22 +71,15 @@ def _enable_denoiser(scene):
         pass
 
 
-# ── Main-thread scene loader (via bpy.app.timers) ─────────────
+# ── Scene loading (called from main loop, NOT from HTTP thread) ──
 
-def _load_timer():
-    """Runs on Blender's main thread. Safe to call open_mainfile here."""
-    global _pending_load_path, _scene_loaded, _scene_path, _scene_loading
-
-    with _pending_load_lock:
-        path = _pending_load_path
-        _pending_load_path = None
-
-    if not path:
-        return None  # Nothing queued — unregister
+def _do_load_scene(path):
+    """Open a .blend file. MUST be called from the main thread."""
+    global _scene_loaded, _scene_path, _scene_loading
 
     _scene_loading = True
     _scene_loaded  = False
-    print(f"[Worker] Main-thread open_mainfile: {path}")
+    print(f"[Worker] Loading scene from disk: {path}")
 
     try:
         bpy.ops.wm.open_mainfile(filepath=path)
@@ -101,22 +91,6 @@ def _load_timer():
         print(f"[Worker] open_mainfile failed: {e}")
     finally:
         _scene_loading = False
-
-    return None  # Unregister timer (one-shot)
-
-
-def _queue_scene_load_path(blend_path):
-    """Queue a blend file path for main-thread loading."""
-    global _scene_loaded
-
-    with _pending_load_lock:
-        _pending_load_path = blend_path
-
-    _scene_loaded = False
-
-    # Schedule the load on the main thread
-    bpy.app.timers.register(_load_timer, first_interval=0.05)
-    print(f"[Worker] Scene load queued: {blend_path} → main thread")
 
 
 # ── Camera helper ─────────────────────────────────────────────
@@ -144,10 +118,10 @@ def render_frame(width, height, samples=1, quality=75):
     global _last_render_b64, _rendering
 
     scene = bpy.context.scene
-    scene.render.resolution_x        = width
-    scene.render.resolution_y        = height
+    scene.render.resolution_x         = width
+    scene.render.resolution_y         = height
     scene.render.resolution_percentage = 100
-    scene.cycles.samples              = samples
+    scene.cycles.samples               = samples
     _enable_denoiser(scene)
     scene.render.image_settings.file_format = "JPEG"
     scene.render.image_settings.quality     = quality
@@ -195,42 +169,38 @@ class WorkerHandler(BaseHTTPRequestHandler):
 
             if msg_type == "ping":
                 response = {
-                    "type":         "pong",
-                    "worker":       True,
-                    "build":        "b31",
-                    "scene_loaded": _scene_loaded,
-                    "scene_loading":_scene_loading,
-                    "rendering":    _rendering,
-                    "compute":      _compute_type,
+                    "type":          "pong",
+                    "worker":        True,
+                    "build":         "b32",
+                    "scene_loaded":  _scene_loaded,
+                    "scene_loading": _scene_loading,
+                    "rendering":     _rendering,
+                    "compute":       _compute_type,
                 }
 
-            elif msg_type in ("load_scene_path", "load_scene"):
-                # load_scene_path = preferred (path only, no large data transfer)
-                # load_scene      = legacy fallback (base64 in body — avoid for large files)
-                if msg_type == "load_scene_path":
-                    blend_path = data.get("path", "")
-                    if not blend_path or not os.path.isfile(blend_path):
-                        response = {"type": "error", "message": f"File not found: {blend_path}"}
-                    else:
-                        _queue_scene_load_path(blend_path)
-                        response = {
-                            "type":    "scene_loading",
-                            "message": "Loading on main thread — poll ping for scene_loaded=true",
-                        }
+            elif msg_type == "load_scene_path":
+                blend_path = data.get("path", "")
+                if not blend_path or not os.path.isfile(blend_path):
+                    response = {"type": "error", "message": f"File not found: {blend_path}"}
                 else:
-                    # Legacy: base64 in body — save to temp then queue
-                    blend_b64 = data.get("blend_data", "")
-                    if not blend_b64:
-                        response = {"type": "error", "message": "No blend_data"}
-                    else:
-                        tmp = tempfile.NamedTemporaryFile(suffix=".blend", delete=False)
-                        tmp.write(base64.b64decode(blend_b64))
-                        tmp.close()
-                        _queue_scene_load_path(tmp.name)
-                        response = {
-                            "type":    "scene_loading",
-                            "message": "Loading on main thread — poll ping for scene_loaded=true",
-                        }
+                    # Queue for main loop — do NOT call open_mainfile here
+                    global _pending_load_path
+                    with _pending_load_lock:
+                        _pending_load_path = blend_path
+                    response = {"type": "scene_loading"}
+
+            elif msg_type == "load_scene":
+                # Legacy: base64 in body — save to temp file then queue
+                blend_b64 = data.get("blend_data", "")
+                if not blend_b64:
+                    response = {"type": "error", "message": "No blend_data"}
+                else:
+                    tmp = tempfile.NamedTemporaryFile(suffix=".blend", delete=False)
+                    tmp.write(base64.b64decode(blend_b64))
+                    tmp.close()
+                    with _pending_load_lock:
+                        _pending_load_path = tmp.name
+                    response = {"type": "scene_loading"}
 
             elif msg_type == "update_camera":
                 view_matrix = data.get("view_matrix")
@@ -331,24 +301,46 @@ class WorkerHandler(BaseHTTPRequestHandler):
 # ── Main ──────────────────────────────────────────────────────
 
 def main():
+    global _pending_load_path
+
     setup_gpu()
 
     print("=" * 55)
-    print(f"[Worker] Blender Render Worker b31 on port {WORKER_PORT}")
+    print(f"[Worker] Blender Render Worker b32 on port {WORKER_PORT}")
     print(f"[Worker] Blender {bpy.app.version_string}")
     print(f"[Worker] Compute: {_compute_type}")
-    print(f"[Worker] open_mainfile runs on main thread via bpy.app.timers")
     print("=" * 55)
 
-    server = HTTPServer(("0.0.0.0", WORKER_PORT), WorkerHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    print(f"[Worker] HTTP listener on port {WORKER_PORT}")
-    print("[Worker] Ready for commands")
+    def _start_http():
+        """Start (or restart) the HTTP server on a daemon thread."""
+        srv = HTTPServer(("0.0.0.0", WORKER_PORT), WorkerHandler)
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        print(f"[Worker] HTTP on port {WORKER_PORT} — ready")
+        return srv, t
+
+    server, http_thread = _start_http()
 
     try:
         while True:
+            # ── Check for pending scene load ──
+            with _pending_load_lock:
+                path = _pending_load_path
+                _pending_load_path = None
+
+            if path:
+                _do_load_scene(path)
+                # Restart HTTP server if open_mainfile killed the daemon thread
+                if not http_thread.is_alive():
+                    print("[Worker] HTTP thread died after open_mainfile — restarting")
+                    try:
+                        server.shutdown()
+                    except Exception:
+                        pass
+                    server, http_thread = _start_http()
+
             time.sleep(0.1)
+
     except KeyboardInterrupt:
         print("[Worker] Shutting down")
         server.shutdown()
