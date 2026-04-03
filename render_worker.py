@@ -91,6 +91,15 @@ _retry_backoff_seconds = [0.5, 1.0, 2.0, 4.0, 8.0]  # Exponential backoff per at
 
 _start_time = time.time()
 
+# ── Fallback State Tracking (thread-safe) ────────────────────────
+_fallback_state = {
+    "has_cpu_fallback": False,          # True if GPU failed and we fell back to CPU
+    "samples_degraded": False,          # True if render samples were reduced due to timeout
+    "worker_corrupted": False,          # True if scene load failed and worker state is bad
+    "fallback_transitions": [],         # Log of all fallback state transitions
+}
+_fallback_lock = threading.Lock()
+
 # ── Metrics Tracking (thread-safe) ─────────────────────────────
 _metrics = {
     "loads_total": 0,
@@ -157,6 +166,37 @@ def _record_metric(metric_name, success=True, error_msg=None):
                  f"Renders: {_metrics['renders_success']}/{_metrics['renders_total']} success, "
                  f"Recent errors: {len(_metrics['errors'])}", "INFO")
             _last_metrics_log = time.time()
+
+
+def _record_fallback(state_name, value, reason=""):
+    """Record a fallback state transition (thread-safe)."""
+    with _fallback_lock:
+        old_value = _fallback_state.get(state_name, False)
+        if old_value != value:
+            _fallback_state[state_name] = value
+            transition = {
+                "timestamp": time.time(),
+                "state": state_name,
+                "old_value": old_value,
+                "new_value": value,
+                "reason": reason,
+            }
+            _fallback_state["fallback_transitions"].append(transition)
+            # Keep last 50 transitions
+            if len(_fallback_state["fallback_transitions"]) > 50:
+                _fallback_state["fallback_transitions"].pop(0)
+            _log(f"[FALLBACK_STATE] {state_name}: {old_value} → {value} | {reason}")
+
+
+def _get_fallback_state():
+    """Get current fallback state (thread-safe)."""
+    with _fallback_lock:
+        return {
+            "has_cpu_fallback": _fallback_state["has_cpu_fallback"],
+            "samples_degraded": _fallback_state["samples_degraded"],
+            "worker_corrupted": _fallback_state["worker_corrupted"],
+            "recent_transitions": _fallback_state["fallback_transitions"][-5:],  # Last 5 transitions
+        }
 
 
 # ── Timeout Handler ───────────────────────────────────────────
@@ -336,6 +376,8 @@ def _setup_gpu_impl():
         prefs = bpy.context.preferences
         cycles_addon = prefs.addons.get("cycles")
         if cycles_addon:
+            gpu_success = False
+            # Try OPTIX first, then CUDA, finally fallback to CPU
             for device_type in ("OPTIX", "CUDA"):
                 try:
                     cycles_addon.preferences.compute_device_type = device_type
@@ -346,27 +388,48 @@ def _setup_gpu_impl():
                             d.use = True
                             _log(f"Device: {d.name} ({device_type})")
                         _compute_type = device_type
-                        _log(f"Compute: {device_type}")
+                        _log(f"[GPU_SETUP] Compute: {device_type}")
+                        gpu_success = True
                         break
                 except Exception as e:
-                    _log(f"{device_type} unavailable: {e}")
+                    _log(f"[GPU_SETUP] {device_type} unavailable: {e}")
+
+            # If no GPU device found, fall back to CPU
+            if not gpu_success:
+                _log(f"[GPU_FALLBACK] No GPU devices found, falling back to CPU rendering")
+                _compute_type = "CPU"
+                _record_fallback("has_cpu_fallback", True, "No GPU devices available")
+
         bpy.context.scene.render.engine = "CYCLES"
-        bpy.context.scene.cycles.device = "GPU"
+        # Set device based on what we detected
+        try:
+            if _compute_type == "CPU":
+                bpy.context.scene.cycles.device = "CPU"
+                _log(f"[GPU_SETUP] Scene device set to CPU")
+            else:
+                bpy.context.scene.cycles.device = "GPU"
+                _log(f"[GPU_SETUP] Scene device set to GPU ({_compute_type})")
+        except Exception as e:
+            _log(f"[GPU_SETUP] Could not set scene device: {e}")
     except Exception as e:
-        _log(f"GPU setup warning: {e}")
+        _log(f"[GPU_SETUP] setup_gpu error: {e}")
 
 
 def setup_gpu():
-    """Setup GPU with timeout protection"""
+    """Setup GPU with timeout protection and GPU fallback"""
     try:
         run_with_timeout(_setup_gpu_impl, _TIMEOUT_SETUP_GPU, "setup_gpu")
     except TimeoutError as e:
-        _log(f"[TIMEOUT_ERROR] setup_gpu failed: {e}")
-        _log(f"[FALLBACK] Falling back to CPU rendering")
+        _log(f"[TIMEOUT_ERROR] setup_gpu timed out: {e}")
+        _log(f"[GPU_FALLBACK] Falling back to CPU rendering")
         global _compute_type
         _compute_type = "CPU"
+        _record_fallback("has_cpu_fallback", True, "GPU setup timeout")
     except Exception as e:
-        _log(f"setup_gpu error: {e}")
+        _log(f"[GPU_SETUP] Unexpected error: {e}")
+        _log(f"[GPU_FALLBACK] Falling back to CPU rendering")
+        _compute_type = "CPU"
+        _record_fallback("has_cpu_fallback", True, f"GPU setup error: {str(e)[:100]}")
 
 
 def _enable_denoiser(scene):
@@ -412,15 +475,6 @@ def render_frame(width, height, samples=1, quality=75):
     if validation_msg != "OK":
         _log(f"[VALIDATION] {validation_msg}")
 
-    scene = bpy.context.scene
-    scene.render.resolution_x         = width
-    scene.render.resolution_y         = height
-    scene.render.resolution_percentage = 100
-    scene.cycles.samples               = samples
-    _enable_denoiser(scene)
-    scene.render.image_settings.file_format = "JPEG"
-    scene.render.image_settings.quality     = quality
-
     output_dir  = None
     output_path = None
     start       = time.time()
@@ -430,39 +484,73 @@ def render_frame(width, height, samples=1, quality=75):
     try:
         output_dir  = tempfile.mkdtemp(prefix="wrkr_")
         output_path = os.path.join(output_dir, "frame.jpg")
-        scene.render.filepath = output_path
 
-        # Run render with timeout protection
-        try:
-            render_ok = run_with_timeout(
-                lambda: _render_frame_impl(scene, output_path),
-                _TIMEOUT_RENDER,
-                f"render_frame({width}x{height}@{samples}spp)"
-            )
-        except TimeoutError as e:
-            _log(f"[TIMEOUT_ERROR] Render operation exceeded {_TIMEOUT_RENDER}s: {e}")
-            return ""
+        # Render with quality fallback: try full samples, then degrade on timeout
+        samples_attempts = [samples, max(1, samples // 2), max(1, samples // 4), 1]
+        last_error = None
 
-        if render_ok:
-            with open(output_path, "rb") as f:
-                jpg_data = f.read()
-            elapsed_ms = int((time.time() - start) * 1000)
-            result_b64 = base64.b64encode(jpg_data).decode("ascii")
-            denoiser = getattr(scene.cycles, "denoiser", "?")
-            _log(f"{width}x{height} @{samples}spp+{denoiser} {elapsed_ms}ms {len(jpg_data)//1024}KB")
-            _record_metric("render", success=True)
-            return result_b64
-        _log("Render produced no output", "WARNING")
-        _record_metric("render", success=False, error_msg="No output produced")
+        for attempt, current_samples in enumerate(samples_attempts):
+            try:
+                scene = bpy.context.scene
+                scene.render.resolution_x         = width
+                scene.render.resolution_y         = height
+                scene.render.resolution_percentage = 100
+                scene.cycles.samples               = current_samples
+                _enable_denoiser(scene)
+                scene.render.image_settings.file_format = "JPEG"
+                scene.render.image_settings.quality     = quality
+                scene.render.filepath = output_path
+
+                # Run render with timeout protection
+                render_ok = run_with_timeout(
+                    lambda: _render_frame_impl(scene, output_path),
+                    _TIMEOUT_RENDER,
+                    f"render_frame({width}x{height}@{current_samples}spp)"
+                )
+
+                if render_ok:
+                    with open(output_path, "rb") as f:
+                        jpg_data = f.read()
+                    elapsed_ms = int((time.time() - start) * 1000)
+                    result_b64 = base64.b64encode(jpg_data).decode("ascii")
+                    denoiser = getattr(scene.cycles, "denoiser", "?")
+
+                    # Log if we had to degrade samples
+                    if current_samples < samples:
+                        _log(f"[FALLBACK] Render succeeded with degraded samples: {current_samples}/{samples}")
+                        _record_fallback("samples_degraded", True, f"Fallback to {current_samples} samples")
+
+                    _log(f"{width}x{height} @{current_samples}spp+{denoiser} {elapsed_ms}ms {len(jpg_data)//1024}KB")
+                    _record_metric("render", success=True)
+                    return result_b64
+
+                _log(f"[FALLBACK] Attempt {attempt + 1}: Render produced no output, retrying with fewer samples")
+                last_error = "No output produced"
+
+            except TimeoutError as e:
+                if attempt < len(samples_attempts) - 1:
+                    next_samples = samples_attempts[attempt + 1]
+                    _log(f"[FALLBACK] Render timed out at {current_samples} samples, retrying with {next_samples} samples")
+                    _record_fallback("samples_degraded", True, f"Timeout at {current_samples} samples, fallback to {next_samples}")
+                    last_error = str(e)
+                else:
+                    _log(f"[FALLBACK_EXHAUSTED] Render timeout even at 1 sample: {e}")
+                    last_error = f"Timeout: {str(e)[:100]}"
+
+            except Exception as e:
+                if attempt < len(samples_attempts) - 1:
+                    next_samples = samples_attempts[attempt + 1]
+                    _log(f"[FALLBACK] Render error at {current_samples} samples, retrying with {next_samples}: {e}")
+                    last_error = str(e)
+                else:
+                    _log(f"[FALLBACK_EXHAUSTED] Render error even at 1 sample: {e}")
+                    last_error = f"{type(e).__name__}: {str(e)[:100]}"
+
+        # All fallback attempts exhausted
+        _log(f"[FALLBACK] All render attempts exhausted, last error: {last_error}", "ERROR")
+        _record_metric("render", success=False, error_msg=last_error)
         return ""
-    except TimeoutError as e:
-        _log(f"[TIMEOUT] Render timeout: {e}", "ERROR")
-        _record_metric("render", success=False, error_msg=f"Timeout: {str(e)[:100]}")
-        return ""
-    except Exception as e:
-        _log(f"Render error: {e}", "ERROR")
-        _record_metric("render", success=False, error_msg=f"{type(e).__name__}: {str(e)[:100]}")
-        return ""
+
     finally:
         # ATOMIC: Clear _rendering under lock
         with _state_lock:
@@ -496,6 +584,9 @@ class WorkerHandler(BaseHTTPRequestHandler):
                     rendering = _rendering
                     compute = _compute_type
 
+                # Get fallback state
+                fallback_state = _get_fallback_state()
+
                 response = {
                     "type":          "pong",
                     "worker":        True,
@@ -504,10 +595,16 @@ class WorkerHandler(BaseHTTPRequestHandler):
                     "scene_loading": loading,
                     "rendering":     rendering,
                     "compute":       compute,
+                    "fallback_state": {
+                        "has_cpu_fallback": fallback_state["has_cpu_fallback"],
+                        "samples_degraded": fallback_state["samples_degraded"],
+                        "worker_corrupted": fallback_state["worker_corrupted"],
+                    },
                 }
                 # Detailed logging for scene load polling (helps server diagnose hangs)
                 if loading or loaded:
-                    _log(f"[PING] scene_loading={loading}, scene_loaded={loaded}, rendering={rendering}")
+                    _log(f"[PING] scene_loading={loading}, scene_loaded={loaded}, rendering={rendering}, "
+                         f"fallback=[CPU={fallback_state['has_cpu_fallback']}, samples_degraded={fallback_state['samples_degraded']}]")
 
             elif msg_type == "load_scene_path":
                 blend_path = data.get("path", "")

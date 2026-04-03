@@ -191,8 +191,27 @@ def find_blender():
 
 worker_process = None
 worker_ready = False
-_worker_lock = threading.Lock()  # Protects: worker_process, worker_ready, _worker_restart_attempts
+_worker_lock = threading.Lock()  # Protects: worker_process, worker_ready, _worker_restart_attempts, _worker_corrupted
 _worker_restart_attempts = 0  # Track consecutive restart attempts
+_worker_corrupted = False  # Track if worker is in a bad state (scene load failed, etc.)
+
+
+def _mark_worker_corrupted(reason=""):
+    """Mark worker as corrupted and log reason."""
+    global _worker_corrupted
+    with _worker_lock:
+        if not _worker_corrupted:
+            _worker_corrupted = True
+            log.error(f"[WORKER_CORRUPTION] Worker marked corrupted: {reason}")
+
+
+def _clear_worker_corruption():
+    """Clear corruption flag (e.g., after successful restart)."""
+    global _worker_corrupted
+    with _worker_lock:
+        if _worker_corrupted:
+            _worker_corrupted = False
+            log.info(f"[WORKER_CORRUPTION] Worker corruption cleared after restart")
 
 def start_worker():
     """Launch persistent Blender process with render_worker.py."""
@@ -241,6 +260,7 @@ def start_worker():
         if _ping_worker():
             with _worker_lock:
                 worker_ready = True
+            _clear_worker_corruption()  # Clear corruption flag on successful start
             log.info(f"Worker ready on port {WORKER_PORT}")
             return True
 
@@ -280,8 +300,18 @@ def _health_check_worker():
         return False
 
 
-def send_to_worker(data, timeout=30):
-    """Forward a request to the persistent Blender worker with auto-restart on failure."""
+def send_to_worker(data, timeout=30, render_retry=False):
+    """
+    Forward a request to the persistent Blender worker with auto-restart on failure.
+
+    Args:
+        data: JSON request data
+        timeout: Request timeout in seconds
+        render_retry: If True, retry render failures up to 2 times after reconnect
+
+    Returns:
+        Response dict from worker
+    """
     global worker_process, _worker_restart_attempts
 
     # Check if worker process is dead
@@ -291,7 +321,7 @@ def send_to_worker(data, timeout=30):
 
     if proc and proc.poll() is not None:
         # Worker process is dead
-        log.warning(f"Worker process died (attempt {attempts + 1}/3), attempting auto-restart...")
+        log.warning(f"[WORKER_FALLBACK] Worker process died (attempt {attempts + 1}/3), attempting auto-restart...")
 
         if attempts < 3:
             with _worker_lock:
@@ -299,7 +329,7 @@ def send_to_worker(data, timeout=30):
 
             # Attempt to restart
             if start_worker():
-                log.info("Worker auto-restart succeeded")
+                log.info("[WORKER_FALLBACK] Worker auto-restart succeeded")
                 time.sleep(1)  # Brief delay before retry
                 # Retry the send
                 try:
@@ -310,35 +340,67 @@ def send_to_worker(data, timeout=30):
                         headers={"Content-Type": "application/json"},
                     )
                     with urllib.request.urlopen(req, timeout=timeout) as resp:
-                        return json.loads(resp.read().decode("utf-8"))
+                        result = json.loads(resp.read().decode("utf-8"))
+                    return result
                 except Exception as e:
+                    log.error(f"[WORKER_FALLBACK] Send after restart failed: {e}")
                     return {"type": "error", "message": f"Worker error after restart: {e}"}
             else:
-                log.error("Worker auto-restart failed")
+                log.error("[WORKER_FALLBACK] Worker auto-restart failed")
+                _mark_worker_corrupted("Failed to auto-restart after crash")
                 return {"type": "error", "message": "Worker auto-restart failed"}
         else:
-            log.error("Worker restart attempts exhausted (max 3)")
+            log.error("[WORKER_FALLBACK] Worker restart attempts exhausted (max 3)")
+            _mark_worker_corrupted("Restart attempts exhausted")
             return {"type": "error", "message": "Worker restart attempts exhausted"}
 
     # Worker is alive, proceed with send
-    try:
-        body = json.dumps(data).encode("utf-8")
-        req = urllib.request.Request(
-            f"http://localhost:{WORKER_PORT}",
-            data=body,
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
-        # Reset restart attempts on successful send
-        with _worker_lock:
-            _worker_restart_attempts = 0
-        return result
-    except Exception as e:
-        # Connection error — worker may have died
-        log.warning(f"Send to worker failed: {e}")
-        # Don't retry here — let the caller handle or next send attempt will trigger restart check
-        return {"type": "error", "message": f"Worker error: {e}"}
+    for retry_attempt in range(3 if render_retry else 1):
+        try:
+            body = json.dumps(data).encode("utf-8")
+            req = urllib.request.Request(
+                f"http://localhost:{WORKER_PORT}",
+                data=body,
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+            # Reset restart attempts on successful send
+            with _worker_lock:
+                _worker_restart_attempts = 0
+            return result
+        except urllib.error.HTTPError as e:
+            # HTTP error — could be render timeout or other issue
+            if render_retry and retry_attempt < 2 and e.code in (500, 502, 504):
+                log.warning(f"[RENDER_FALLBACK] HTTP {e.code} on render attempt {retry_attempt + 1}/3, retrying after reconnect...")
+                # Try to reconnect
+                time.sleep(1)
+                continue
+            else:
+                log.warning(f"[WORKER_ERROR] HTTP error {e.code}: {e}")
+                return {"type": "error", "message": f"Worker HTTP error: {e.code}"}
+        except (urllib.error.URLError, Exception) as e:
+            # Connection error — worker may have died or timed out
+            if render_retry and retry_attempt < 2 and "timeout" in str(e).lower():
+                log.warning(f"[RENDER_FALLBACK] Render timeout on attempt {retry_attempt + 1}/3, retrying after reconnect...")
+                # Auto-restart and retry
+                if start_worker():
+                    log.info("[RENDER_FALLBACK] Reconnected after timeout")
+                    time.sleep(1)
+                    continue
+                else:
+                    log.error("[RENDER_FALLBACK] Failed to reconnect after timeout")
+                    _mark_worker_corrupted("Failed to reconnect after render timeout")
+                    return {"type": "error", "message": "Failed to reconnect after render timeout"}
+            else:
+                log.warning(f"[WORKER_ERROR] Send to worker failed: {e}")
+                return {"type": "error", "message": f"Worker error: {e}"}
+
+    # All retries exhausted
+    if render_retry:
+        log.error("[RENDER_FALLBACK] All render retry attempts exhausted")
+        _mark_worker_corrupted("Render failed after 3 attempts")
+        return {"type": "error", "message": "Render failed after 3 retry attempts"}
 
 
 # ── Jobs (for fallback subprocess rendering) ──────────────────
@@ -443,53 +505,90 @@ def handle_message(data):
         with _worker_lock:
             ready = worker_ready
         if ready:
-            # Send just the file PATH — no large data over the socket
-            result = send_to_worker({"type": "load_scene_path", "path": blend_path}, timeout=10)
-            if result is None:
-                return {"type": "error", "message": "Worker did not respond"}
+            # Try to load scene with fallback: clear scene and retry if first attempt fails
+            for load_attempt in range(2):
+                # Send just the file PATH — no large data over the socket
+                result = send_to_worker({"type": "load_scene_path", "path": blend_path}, timeout=10)
+                if result is None:
+                    return {"type": "error", "message": "Worker did not respond"}
 
-            if result.get("type") in ("scene_loading", "scene_loaded"):
-                log.info("Scene queued on worker — polling until loaded...")
-                start_time = time.time()
-                last_state = None
-                consecutive_errors = 0
-                max_wait = 120  # seconds
-
-                for attempt in range(int(max_wait * 10)):  # up to 120 seconds with 0.1s granularity
-                    time.sleep(0.1)
-                    ping = send_to_worker({"type": "ping"}, timeout=5)
-
-                    if not ping:
-                        consecutive_errors += 1
-                        if consecutive_errors > 10:  # 1 second of failed pings
-                            log.error("Worker lost connectivity during scene load")
-                            return {"type": "error", "message": "Worker lost connectivity"}
-                        continue
+                if result.get("type") in ("scene_loading", "scene_loaded"):
+                    log.info(f"Scene queued on worker (attempt {load_attempt + 1}/2) — polling until loaded...")
+                    start_time = time.time()
+                    last_state = None
                     consecutive_errors = 0
+                    max_wait = 120  # seconds
 
-                    scene_loaded = ping.get("scene_loaded", False)
-                    scene_loading = ping.get("scene_loading", False)
-                    current_state = (scene_loading, scene_loaded)
+                    for attempt in range(int(max_wait * 10)):  # up to 120 seconds with 0.1s granularity
+                        time.sleep(0.1)
+                        ping = send_to_worker({"type": "ping"}, timeout=5)
 
-                    # Log state changes
-                    if current_state != last_state:
-                        elapsed = time.time() - start_time
-                        log.info(f"[{elapsed:.1f}s] scene_loading={scene_loading}, scene_loaded={scene_loaded}")
-                        last_state = current_state
+                        if not ping:
+                            consecutive_errors += 1
+                            if consecutive_errors > 10:  # 1 second of failed pings
+                                log.error("[SCENE_LOAD] Worker lost connectivity during scene load")
+                                return {"type": "error", "message": "Worker lost connectivity"}
+                            continue
+                        consecutive_errors = 0
 
-                    if scene_loaded:
-                        elapsed = time.time() - start_time
-                        log.info(f"Worker scene ready ({elapsed:.1f}s)")
-                        return {"type": "scene_cached", "scene_id": "worker", "objects": 0}
+                        scene_loaded = ping.get("scene_loaded", False)
+                        scene_loading = ping.get("scene_loading", False)
+                        current_state = (scene_loading, scene_loaded)
 
-                    # Detect failed load early: state stopped changing and load failed
-                    if not scene_loading and not scene_loaded and last_state and last_state[0]:
-                        log.error("Worker load failed (scene_loading→False without scene_loaded→True)")
-                        return {"type": "error", "message": "Worker failed to load scene — check Blender logs"}
+                        # Log state changes
+                        if current_state != last_state:
+                            elapsed = time.time() - start_time
+                            log.info(f"[{elapsed:.1f}s] scene_loading={scene_loading}, scene_loaded={scene_loaded}")
+                            last_state = current_state
 
-                return {"type": "error", "message": f"Worker scene load timed out ({max_wait}s)"}
+                        if scene_loaded:
+                            elapsed = time.time() - start_time
+                            log.info(f"[SCENE_LOAD] Worker scene ready ({elapsed:.1f}s)")
+                            return {"type": "scene_cached", "scene_id": "worker", "objects": 0}
 
-            return result  # pass through any error
+                        # Detect failed load early: state stopped changing and load failed
+                        if not scene_loading and not scene_loaded and last_state and last_state[0]:
+                            log.error("[SCENE_LOAD_FALLBACK] Worker load failed (scene_loading→False without scene_loaded→True)")
+
+                            # If this is the first attempt, try fallback: clear scene and retry
+                            if load_attempt == 0:
+                                log.info("[SCENE_LOAD_FALLBACK] Attempting fallback: clear scene and retry...")
+                                _mark_worker_corrupted("Scene load failed, will try clear/reload")
+                                # Try to clear the scene (this may fail if worker is really broken)
+                                try:
+                                    send_to_worker({"type": "clear_scene"}, timeout=5)
+                                except Exception as e:
+                                    log.warning(f"[SCENE_LOAD_FALLBACK] Could not clear scene: {e}")
+                                # Continue to next load_attempt (which will retry)
+                                break
+                            else:
+                                return {"type": "error", "message": "Worker failed to load scene — worker is in bad state, try reconnecting"}
+
+                    if load_attempt < 1:
+                        # First attempt timed out, but we didn't catch early failure
+                        log.warning(f"[SCENE_LOAD_FALLBACK] Scene load timed out on attempt 1/2, retrying...")
+                        _mark_worker_corrupted("Scene load timeout, will try clear/reload")
+                        # Try clear and retry
+                        try:
+                            send_to_worker({"type": "clear_scene"}, timeout=5)
+                        except Exception as e:
+                            log.warning(f"[SCENE_LOAD_FALLBACK] Could not clear scene: {e}")
+                        continue
+                    else:
+                        return {"type": "error", "message": f"Worker scene load timed out after fallback ({max_wait}s)"}
+
+                # If we get here with an error, try fallback on first attempt
+                if load_attempt == 0 and result.get("type") == "error":
+                    log.info("[SCENE_LOAD_FALLBACK] Scene load returned error, attempting fallback...")
+                    _mark_worker_corrupted(f"Scene load error: {result.get('message', 'unknown')}")
+                    try:
+                        send_to_worker({"type": "clear_scene"}, timeout=5)
+                    except Exception as e:
+                        log.warning(f"[SCENE_LOAD_FALLBACK] Could not clear scene: {e}")
+                    continue
+
+                # Final attempt failed, pass through error
+                return result
         else:
             # No worker — file is on disk, scene_id is the path key
             return {"type": "scene_cached", "scene_id": scene_id}
@@ -514,6 +613,7 @@ def handle_message(data):
         if not ready:
             return {"type": "error", "message": "Worker not ready"}
 
+        # Render with fallback: auto-reconnect and retry up to 2 times on timeout
         result = send_to_worker({
             "type": "render_frame",
             "width": data.get("width", 640),
@@ -521,7 +621,7 @@ def handle_message(data):
             "samples": data.get("samples", 1),   # b24: default 1 (denoiser handles quality)
             "quality": data.get("quality", 75),   # b24: bumped quality
             "view_matrix": data.get("view_matrix"),
-        }, timeout=15)
+        }, timeout=15, render_retry=True)
 
         if result.get("type") == "frame_result":
             return {
@@ -545,12 +645,13 @@ def handle_message(data):
         with _worker_lock:
             ready = worker_ready
         if ready and (scene_id == "worker" or not blend_b64):
+            # Final render with fallback: auto-reconnect and retry up to 2 times on timeout
             result = send_to_worker({
                 "type": "render_final",
                 "width": width,
                 "height": height,
                 "samples": samples,
-            }, timeout=600)
+            }, timeout=600, render_retry=True)
 
             if result.get("type") == "render_result":
                 job_id = str(uuid.uuid4())[:8]
