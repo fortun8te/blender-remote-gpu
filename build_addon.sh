@@ -26,36 +26,36 @@ sed -i '' "s/^__version__ = .*/\__version__ = \"${NEW_VERSION}\"/" addon/__init_
 sed -i '' "s/^BUILD = .*/BUILD = \"${NEW_BUILD}\"/" addon/__init__.py
 sed -i '' "s/^BUILD_DATE = .*/BUILD_DATE = \"${BUILD_DATE}\"/" addon/__init__.py
 
-echo "🔨 Building Blender Remote GPU addon"
-echo "   Old build: $CURRENT_BUILD → New build: $NEW_BUILD"
+echo "Building Blender Remote GPU addon"
+echo "   Old build: $CURRENT_BUILD -> New build: $NEW_BUILD"
 echo "   Version: $NEW_VERSION"
 echo "   Date: $BUILD_DATE"
 
 # Clean old builds
 rm -f blender_remote_gpu_addon*.zip
 
-# Create ZIP with version in filename
+# Create ZIP — NO external modules needed (zero dependencies)
 ZIP_NAME="blender_remote_gpu_addon_${NEW_BUILD}.zip"
-echo "📦 Creating: $ZIP_NAME"
+echo "Creating: $ZIP_NAME"
 
-# Zip only the addon folder (not server/ or shared/)
-# Include modules/ so websockets is bundled with the addon
-zip -r "$ZIP_NAME" addon/ -x "addon/__pycache__/*" "addon/*.pyc" "addon/modules/__pycache__/*" > /dev/null 2>&1
+zip -r "$ZIP_NAME" addon/ \
+    -x "addon/__pycache__/*" \
+    -x "addon/*.pyc" \
+    -x "addon/modules/*" \
+    > /dev/null 2>&1
 
 # Verify
 if [ -f "$ZIP_NAME" ]; then
     SIZE=$(du -h "$ZIP_NAME" | cut -f1)
-    echo "✅ Build successful: $ZIP_NAME ($SIZE)"
-
-    # Show contents
+    echo "Build successful: $ZIP_NAME ($SIZE)"
     echo ""
-    echo "📋 Contents:"
-    unzip -l "$ZIP_NAME" | head -15
+    echo "Contents:"
+    unzip -l "$ZIP_NAME"
 else
-    echo "❌ Build failed"
+    echo "Build failed"
     exit 1
 fi
 
-# Also create latest symlink
+# Create latest symlink
 ln -sf "$ZIP_NAME" blender_remote_gpu_addon_latest.zip
-echo "🔗 Symlink: blender_remote_gpu_addon_latest.zip → $ZIP_NAME"
+echo "Symlink: blender_remote_gpu_addon_latest.zip -> $ZIP_NAME"
