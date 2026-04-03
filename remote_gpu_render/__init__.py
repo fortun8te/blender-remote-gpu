@@ -9,8 +9,8 @@ v4.0: COMPLETE REWRITE — Dispatcher architecture (R1-R4 agents)
   - Comprehensive test plan and deployment guide included
 """
 
-__version__ = "2.0.0"
-BUILD = "v4"
+__version__ = "1.0.38"
+BUILD = "b38"
 BUILD_DATE = "2026-04-03"
 
 bl_info = {
