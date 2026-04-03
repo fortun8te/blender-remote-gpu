@@ -35,8 +35,33 @@ try:
     import gpu
     from gpu_extras.presets import draw_texture_2d
     HAS_GPU = True
-except ImportError:
-    HAS_GPU = False
+except Exception:
+    # Blender 5+ may have moved draw_texture_2d — define a fallback
+    try:
+        import gpu
+        from gpu_extras.batch import batch_for_shader as _bfs
+
+        def draw_texture_2d(texture, position, width, height):
+            shader = gpu.shader.from_builtin('IMAGE')
+            batch = _bfs(
+                shader, 'TRI_FAN',
+                {
+                    "pos": (
+                        (position[0], position[1]),
+                        (position[0] + width, position[1]),
+                        (position[0] + width, position[1] + height),
+                        (position[0], position[1] + height),
+                    ),
+                    "texCoord": ((0, 0), (1, 0), (1, 1), (0, 1)),
+                },
+            )
+            shader.bind()
+            shader.uniform_sampler("image", texture)
+            batch.draw(shader)
+
+        HAS_GPU = True
+    except Exception:
+        HAS_GPU = False
 
 # ── Global state ───────────────────────────────────────────────
 

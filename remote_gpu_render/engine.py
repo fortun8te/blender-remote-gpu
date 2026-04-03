@@ -18,7 +18,6 @@ class RemoteRenderEngine(bpy.types.RenderEngine):
     bl_idname = "REMOTE_GPU"
     bl_label = "Remote GPU"
     bl_use_preview = False
-    bl_use_gpu_context = False   # Not needed — no viewport rendering in engine
 
     # Shared connection state (used by operators + live_preview)
     _connection = None
