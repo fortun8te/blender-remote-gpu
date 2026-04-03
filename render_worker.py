@@ -24,6 +24,7 @@ import traceback
 from collections import deque
 import signal
 import platform
+import atexit
 
 # Try to import psutil for memory tracking (optional)
 try:
@@ -528,10 +529,42 @@ class WorkerHandler(BaseHTTPRequestHandler):
         pass
 
 
+# ── Graceful Shutdown ─────────────────────────────────────────
+
+def _cleanup_on_exit():
+    """Cleanup resources on shutdown — called by atexit or KeyboardInterrupt."""
+    _log("[SHUTDOWN] Starting graceful shutdown sequence...")
+
+    # Clear retry queue to free memory
+    try:
+        with _retry_lock:
+            _log(f"[SHUTDOWN] Clearing retry queue ({len(_load_retry_queue)} items)")
+            _load_retry_queue.clear()
+    except Exception as e:
+        _log(f"[SHUTDOWN] Error clearing retry queue: {e}")
+
+    # Close any open HTTP server
+    global _http_server
+    if '_http_server' in globals():
+        try:
+            _log("[SHUTDOWN] Closing HTTP server...")
+            _http_server.shutdown()
+            _log("[SHUTDOWN] HTTP server closed")
+        except Exception as e:
+            _log(f"[SHUTDOWN] HTTP server shutdown error: {e}")
+
+    _log("[SHUTDOWN] Cleanup complete — worker exiting")
+
+
 # ── Main ──────────────────────────────────────────────────────
 
+_http_server = None  # Global reference for cleanup
+
 def main():
-    global _pending_path, _scene_loaded, _scene_loading
+    global _pending_path, _scene_loaded, _scene_loading, _http_server
+
+    # Register cleanup handler for graceful shutdown on exit
+    atexit.register(_cleanup_on_exit)
 
     setup_gpu()
 
@@ -542,8 +575,8 @@ def main():
     _log("=" * 55)
     _debug(f"Starting with extreme debug logging enabled")
 
-    server = HTTPServer(("0.0.0.0", WORKER_PORT), WorkerHandler)
-    http_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    _http_server = HTTPServer(("0.0.0.0", WORKER_PORT), WorkerHandler)
+    http_thread = threading.Thread(target=_http_server.serve_forever, daemon=True)
     http_thread.start()
     _log(f"HTTP on port {WORKER_PORT} — ready")
 
@@ -655,11 +688,12 @@ def main():
                 if not http_thread.is_alive():
                     _log("[HTTP_RESTART] HTTP thread died — restarting")
                     try:
-                        server.shutdown()
+                        if _http_server:
+                            _http_server.shutdown()
                     except Exception:
                         pass
-                    server = HTTPServer(("0.0.0.0", WORKER_PORT), WorkerHandler)
-                    http_thread = threading.Thread(target=server.serve_forever, daemon=True)
+                    _http_server = HTTPServer(("0.0.0.0", WORKER_PORT), WorkerHandler)
+                    http_thread = threading.Thread(target=_http_server.serve_forever, daemon=True)
                     http_thread.start()
                     _log("[HTTP_RESTART_OK] HTTP restarted")
 
@@ -683,8 +717,8 @@ def main():
             time.sleep(0.05)  # Reduced sleep for more responsive event pumping
 
     except KeyboardInterrupt:
-        _log("Shutting down")
-        server.shutdown()
+        _log("[SHUTDOWN] Received KeyboardInterrupt (Ctrl+C)")
+        _cleanup_on_exit()
 
 
 if __name__ == "__main__":

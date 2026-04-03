@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -567,6 +568,50 @@ def run_xmlrpc():
     server.register_function(xmlrpc_handle, "handle")
     server.serve_forever()
 
+# ── Graceful Shutdown ─────────────────────────────────────────
+
+def shutdown_worker():
+    """Gracefully shutdown the persistent worker process."""
+    global worker_process
+
+    with _worker_lock:
+        proc = worker_process
+
+    if not proc:
+        log.info("[SHUTDOWN] Worker process is not running")
+        return
+
+    # Check if already dead
+    if proc.poll() is not None:
+        log.info("[SHUTDOWN] Worker process already dead")
+        return
+
+    log.info("[SHUTDOWN] Terminating worker process (SIGTERM)...")
+    try:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+            log.info("[SHUTDOWN] Worker process terminated gracefully")
+        except subprocess.TimeoutExpired:
+            log.warning("[SHUTDOWN] Worker process did not exit after 5s, sending SIGKILL...")
+            proc.kill()
+            try:
+                proc.wait(timeout=2)
+                log.info("[SHUTDOWN] Worker process killed")
+            except subprocess.TimeoutExpired:
+                log.error("[SHUTDOWN] Worker process still alive after SIGKILL (should not happen)")
+    except Exception as e:
+        log.error(f"[SHUTDOWN] Error terminating worker: {e}")
+
+
+def shutdown_handler(signum, frame):
+    """Signal handler for graceful shutdown."""
+    log.info("[SHUTDOWN] Received SIGINT (Ctrl+C)")
+    shutdown_worker()
+    log.info("[SHUTDOWN] Shutdown complete, exiting...")
+    sys.exit(0)
+
+
 # ── Main ──────────────────────────────────────────────────────
 
 def run_beacon():
@@ -593,6 +638,9 @@ def run_beacon():
 
 
 def main():
+    # Register signal handler for graceful shutdown
+    signal.signal(signal.SIGINT, shutdown_handler)
+
     detect_gpu()
     blender = find_blender()
 
@@ -631,12 +679,10 @@ def main():
                 log.warning("Worker died — restarting...")
                 start_worker()
     except KeyboardInterrupt:
-        log.info("Shutting down")
-        # ATOMIC: Get worker_process under lock
-        with _worker_lock:
-            proc = worker_process
-        if proc:
-            proc.terminate()
+        log.info("[SHUTDOWN] KeyboardInterrupt caught in main loop")
+        shutdown_worker()
+        log.info("[SHUTDOWN] Server shutdown complete")
+        sys.exit(0)
 
 
 if __name__ == "__main__":
