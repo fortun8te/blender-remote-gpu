@@ -180,6 +180,88 @@ def _should_retry_now(last_retry_time, attempt):
     return elapsed >= backoff
 
 
+# ── Input Validation ──────────────────────────────────────────
+
+def validate_path(path):
+    """
+    Validate a file path for security and correctness.
+
+    Checks:
+    - path is string type (not None/bytes)
+    - path does not contain path traversal (.. sequences)
+    - path length is within limits (< 500 chars)
+    - path ends with .blend extension
+    - file exists and is readable
+
+    Returns:
+        (is_valid: bool, message: str)
+    """
+    if not isinstance(path, str):
+        return False, "Path must be string, not None/bytes"
+
+    if ".." in path:
+        return False, "Path traversal (..) not allowed"
+
+    if len(path) > 500:
+        return False, f"Path too long ({len(path)} > 500 chars)"
+
+    if not path.endswith(".blend"):
+        return False, "File must have .blend extension"
+
+    if not os.path.isfile(path):
+        return False, "File not found or not readable"
+
+    return True, "OK"
+
+
+def validate_render_params(width, height, samples, quality):
+    """
+    Validate and clamp render parameters to safe ranges.
+
+    Returns:
+        (validated_width, validated_height, validated_samples, validated_quality, message: str)
+    """
+    # Width: 1-7680 (4K limit)
+    try:
+        w = int(width) if width is not None else 640
+        w = max(1, min(7680, w))
+    except (ValueError, TypeError):
+        w = 640
+
+    # Height: 1-7680 (4K limit)
+    try:
+        h = int(height) if height is not None else 360
+        h = max(1, min(7680, h))
+    except (ValueError, TypeError):
+        h = 360
+
+    # Samples: 1-1024
+    try:
+        s = int(samples) if samples is not None else 1
+        s = max(1, min(1024, s))
+    except (ValueError, TypeError):
+        s = 1
+
+    # Quality: 1-100 (JPEG quality)
+    try:
+        q = int(quality) if quality is not None else 75
+        q = max(1, min(100, q))
+    except (ValueError, TypeError):
+        q = 75
+
+    msg = ""
+    if w != width:
+        msg += f"width clamped to {w}; "
+    if h != height:
+        msg += f"height clamped to {h}; "
+    if s != samples:
+        msg += f"samples clamped to {s}; "
+    if q != quality:
+        msg += f"quality clamped to {q}; "
+
+    return w, h, s, q, msg.rstrip("; ") if msg else "OK"
+
+
 # ── GPU setup ─────────────────────────────────────────────────
 
 def _setup_gpu_impl():
@@ -259,6 +341,11 @@ def _render_frame_impl(scene, output_path):
 
 def render_frame(width, height, samples=1, quality=75):
     global _rendering
+
+    # Validate and clamp render parameters
+    width, height, samples, quality, validation_msg = validate_render_params(width, height, samples, quality)
+    if validation_msg != "OK":
+        _log(f"[VALIDATION] {validation_msg}")
 
     scene = bpy.context.scene
     scene.render.resolution_x         = width
@@ -356,9 +443,12 @@ class WorkerHandler(BaseHTTPRequestHandler):
             elif msg_type == "load_scene_path":
                 blend_path = data.get("path", "")
                 _debug(f"[HTTP] load_scene_path request: {blend_path}")
-                if not blend_path or not os.path.isfile(blend_path):
-                    _debug(f"[HTTP] File check failed - exists: {os.path.isfile(blend_path) if blend_path else False}")
-                    response = {"type": "error", "message": f"File not found: {blend_path}"}
+
+                # Validate path
+                is_valid, validation_msg = validate_path(blend_path)
+                if not is_valid:
+                    _log(f"[VALIDATION_ERROR] load_scene_path: {validation_msg}")
+                    response = {"type": "error", "message": f"Invalid path: {validation_msg}"}
                 else:
                     _debug(f"[HTTP] File validated, acquiring lock...")
                     with _pending_lock:
@@ -376,13 +466,22 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 else:
                     tmp_file = None
                     try:
-                        tmp_file = tempfile.NamedTemporaryFile(suffix=".blend", delete=False)
-                        tmp_file.write(base64.b64decode(blend_b64))
-                        tmp_file.close()
-                        with _pending_lock:
-                            _pending_path = tmp_file.name
-                        _log(f"Queued scene load (from b64): {tmp_file.name}")
-                        response = {"type": "scene_loading"}
+                        # Validate base64 is properly formatted
+                        try:
+                            blend_data = base64.b64decode(blend_b64, validate=True)
+                        except Exception as e:
+                            _log(f"[VALIDATION_ERROR] Invalid base64 data: {e}")
+                            response = {"type": "error", "message": f"Invalid base64 encoding: {str(e)[:100]}"}
+                            blend_data = None
+
+                        if blend_data is not None:
+                            tmp_file = tempfile.NamedTemporaryFile(suffix=".blend", delete=False)
+                            tmp_file.write(blend_data)
+                            tmp_file.close()
+                            with _pending_lock:
+                                _pending_path = tmp_file.name
+                            _log(f"Queued scene load (from b64): {tmp_file.name}")
+                            response = {"type": "scene_loading"}
                     except Exception as e:
                         _log(f"Error writing temp scene file: {e}")
                         response = {"type": "error", "message": "Failed to load scene data"}
@@ -424,6 +523,12 @@ class WorkerHandler(BaseHTTPRequestHandler):
                     samples     = data.get("samples", 1)
                     quality     = data.get("quality", 75)
                     view_matrix = data.get("view_matrix")
+
+                    # Validate render parameters
+                    width, height, samples, quality, validation_msg = validate_render_params(width, height, samples, quality)
+                    if validation_msg != "OK":
+                        _log(f"[VALIDATION] render_frame: {validation_msg}")
+
                     with _render_lock:
                         if view_matrix:
                             flat = ([x for row in view_matrix for x in row]
@@ -449,6 +554,11 @@ class WorkerHandler(BaseHTTPRequestHandler):
                     width   = data.get("width", 1920)
                     height  = data.get("height", 1080)
                     samples = data.get("samples", 128)
+
+                    # Validate render parameters
+                    width, height, samples, quality, validation_msg = validate_render_params(width, height, samples, 100)
+                    if validation_msg != "OK":
+                        _log(f"[VALIDATION] render_final: {validation_msg}")
                     output_dir = None
                     try:
                         with _render_lock:

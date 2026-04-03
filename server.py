@@ -29,6 +29,61 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+
+# ── Input Validation ──────────────────────────────────────────
+
+def validate_base64(data_b64, max_size_mb=500):
+    """
+    Validate base64-encoded data.
+
+    Checks:
+    - data_b64 is valid base64
+    - decoded size does not exceed max_size_mb
+
+    Args:
+        data_b64: Base64 string
+        max_size_mb: Maximum size in megabytes (default 500)
+
+    Returns:
+        (is_valid: bool, decoded_data: bytes or None, message: str)
+    """
+    if not data_b64:
+        return False, None, "No data provided"
+
+    if not isinstance(data_b64, str):
+        return False, None, "Data must be string"
+
+    try:
+        decoded = base64.b64decode(data_b64, validate=True)
+    except Exception as e:
+        return False, None, f"Invalid base64 encoding: {str(e)[:100]}"
+
+    size_mb = len(decoded) / 1_048_576
+    if size_mb > max_size_mb:
+        return False, None, f"Data too large ({size_mb:.1f}MB > {max_size_mb}MB limit)"
+
+    return True, decoded, "OK"
+
+
+def validate_json_message(data):
+    """
+    Validate JSON message structure.
+
+    Checks:
+    - data is dict
+    - has required 'type' field
+
+    Returns:
+        (is_valid: bool, message: str)
+    """
+    if not isinstance(data, dict):
+        return False, "Message must be JSON object"
+
+    if "type" not in data:
+        return False, "Message missing required 'type' field"
+
+    return True, "OK"
+
 HTTP_PORT   = 9876
 SOCKET_PORT = 9877
 XMLRPC_PORT = 9878
@@ -307,13 +362,16 @@ def handle_message(data):
     # ── Scene Upload → forward to worker ──
     elif msg_type == "scene_upload":
         blend_b64 = data.get("blend_data", "")
-        if not blend_b64:
-            return {"type": "error", "message": "No blend_data"}
+
+        # Validate base64 and size (500MB limit)
+        is_valid, blend_data, validation_msg = validate_base64(blend_b64, max_size_mb=500)
+        if not is_valid:
+            log.error(f"[VALIDATION_ERROR] scene_upload: {validation_msg}")
+            return {"type": "error", "message": f"Invalid scene data: {validation_msg}"}
 
         # Always save to a shared temp file first — worker reads from disk,
         # so we never send the large blob over the local socket
         scene_id   = str(uuid.uuid4())[:8]
-        blend_data = base64.b64decode(blend_b64)
         blend_path = os.path.join(tempfile.gettempdir(), f"scene_{scene_id}.blend")
         with open(blend_path, "wb") as f:
             f.write(blend_data)
@@ -448,8 +506,13 @@ def handle_message(data):
         if not blend_b64:
             return {"type": "error", "message": "No blend_data or worker scene"}
 
+        # Validate base64 and size (500MB limit)
+        is_valid, blend_data, validation_msg = validate_base64(blend_b64, max_size_mb=500)
+        if not is_valid:
+            log.error(f"[VALIDATION_ERROR] render_submit fallback: {validation_msg}")
+            return {"type": "error", "message": f"Invalid scene data: {validation_msg}"}
+
         job_id = str(uuid.uuid4())[:8]
-        blend_data = base64.b64decode(blend_b64)
         path = os.path.join(tempfile.gettempdir(), f"render_{job_id}.blend")
         with open(path, "wb") as f:
             f.write(blend_data)
@@ -497,10 +560,17 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length)
             data = json.loads(body.decode("utf-8"))
-            msg_type = data.get("type", "?")
-            if msg_type not in ("viewport_render", "viewport_poll"):
-                log.info(f"HTTP {msg_type} from {self.client_address[0]}")
-            response = handle_message(data)
+
+            # Validate JSON message structure
+            is_valid, validation_msg = validate_json_message(data)
+            if not is_valid:
+                log.error(f"[VALIDATION_ERROR] HTTP: {validation_msg}")
+                response = {"type": "error", "message": f"Invalid message: {validation_msg}"}
+            else:
+                msg_type = data.get("type", "?")
+                if msg_type not in ("viewport_render", "viewport_poll"):
+                    log.info(f"HTTP {msg_type} from {self.client_address[0]}")
+                response = handle_message(data)
             resp_bytes = json.dumps(response).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -533,14 +603,23 @@ def handle_tcp_client(conn, addr):
             if not chunk: return
             raw_len += chunk
         length = int.from_bytes(raw_len, "big")
-        if length > 100_000_000: return
+        if length > 100_000_000:
+            log.error("[VALIDATION_ERROR] TCP: Message size exceeds 100MB limit")
+            return
         payload = b""
         while len(payload) < length:
             chunk = conn.recv(min(65536, length - len(payload)))
             if not chunk: return
             payload += chunk
         data = json.loads(payload.decode("utf-8"))
-        response = handle_message(data)
+
+        # Validate JSON message structure
+        is_valid, validation_msg = validate_json_message(data)
+        if not is_valid:
+            log.error(f"[VALIDATION_ERROR] TCP: {validation_msg}")
+            response = {"type": "error", "message": f"Invalid message: {validation_msg}"}
+        else:
+            response = handle_message(data)
         resp_bytes = json.dumps(response).encode("utf-8")
         conn.sendall(len(resp_bytes).to_bytes(4, "big"))
         conn.sendall(resp_bytes)
