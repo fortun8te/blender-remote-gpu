@@ -1,58 +1,323 @@
 # Blender Remote GPU
 
-**Run Cycles on a remote Windows GPU from Blender on another machine** (e.g. Mac + RTX box). A Blender addon talks over **WebSockets** (optionally **TLS** + **Tailscale**) to a small Python server that drives **Blender headless** on the GPU host.
+Render Blender scenes on a remote GPU over Tailscale. Start a render on your Mac in Blender, computing happens on Windows RTX card in real-time.
 
-| Role | Where |
-|------|--------|
-| **Render server** | Windows PC with NVIDIA GPU — run `start_server.bat` or `python server/server.py` |
-| **Blender client** | Your workstation — install the addon from `addon/` or use `blender_remote_gpu_addon.zip` |
-
-## Quick start
-
-1. **GPU machine:** Install [Blender](https://www.blender.org/download/) 4.x, [Python 3.10+](https://www.python.org/), clone this repo, `pip install -r requirements.txt`, then run **`start_server.bat`** (Windows) or **`start_server.sh`** (Linux).
-2. **VPN:** Put both machines on the same [Tailscale](https://tailscale.com/) network (recommended).
-3. **Blender:** Install the addon, set server IP (Tailscale IP of the Windows box) and port **9876**, connect, choose **Cycles REMOTE GPU** as the render engine.
-
-Detailed steps: **[docs/setup/WINDOWS_SETUP.md](docs/setup/WINDOWS_SETUP.md)** · **[docs/setup/TAILSCALE_SETUP.md](docs/setup/TAILSCALE_SETUP.md)** · **[docs/setup/QUICKSTART.md](docs/setup/QUICKSTART.md)**
-
-## Repo layout
-
-```
-addon/          # Blender addon (copy or zip for Preferences → Install)
-server/         # WebSocket render server
-shared/         # Protocol, constants, dev_config (client + server)
-tests/          # Unit tests
-examples/       # Small Python examples
-scripts/        # dev_reload, e2e_simulation, validate_integration
-docs/setup/     # Install & network guides
-docs/reference/ # Architecture, API, delta sync, logging, …
-docs/archive/   # Older reports, audits, E2E notes (historical)
-```
-
-## Documentation index
-
-See **[docs/README.md](docs/README.md)** for a full list of guides.
-
-## Requirements
-
-- **Server:** `websockets`, `msgpack`, `Pillow`, `numpy` (see `requirements.txt`)
-- **Client (Blender):** same stack if you install deps for the addon manually; many setups bundle or install via Blender’s Python.
-
-## Security note
-
-Default dev **API key** and self-signed **TLS** are for private networks. Change `API_KEY`, use real certificates, and restrict access before exposing to the internet.
-
-## Troubleshooting connections
-
-- **TLS mismatch:** Server with TLS → client must use **`wss://`** (`USE_TLS = True` in `shared/dev_config.py`). Plain server (`python server/server.py --plain`) → client **`ws://`** (`USE_TLS = False`). Mismatch fails during handshake.
-- **Windows firewall:** Allow **inbound TCP 9876** on the GPU machine (Admin PowerShell):  
-  `netsh advfirewall firewall add rule name="Blender Remote GPU 9876" dir=in action=allow protocol=TCP localport=9876`
-- **Pull the addon** after `git pull` so fixes (auth, timeouts, `ws`/`wss`) are actually in Blender.
+**Status:** ✓ Phase 1 complete (final render), Phase 2+ (live viewport) coming next
 
 ---
 
-**Suggested GitHub “About” description** (copy into the repository description field):
+## Architecture
 
-> Blender addon + WebSocket server — stream Cycles viewport and final renders to a remote Windows GPU over Tailscale (TLS).
+```
+Mac (Blender 5.0 + addon)              Windows (RTX GPU)
++-----------------------+               +-----------------------+
+| Blender UI            |               | Python WebSocket      |
+|                       |  WebSocket    |                       |
+| RemoteGPUEngine       |<-- ws:// ---->| server.py             |
+| [Connect] [Render]    |  JSON msgs    |                       |
+| GPU: RTX 5090         |  + binary     | • Receive .blend      |
+|                       |  <-- PNG -----| • Render subprocess   |
++-----------------------+               | • Send JPEG back      |
+        ↓                               +-----------------------+
+    Tailscale VPN
+    (encrypted tunnel)
+    Mac: 100.119.65.49
+    Win: 100.74.135.83:9876
+```
 
-**Suggested topics:** `blender`, `cycles`, `remote-rendering`, `websocket`, `gpu`, `tailscale`, `python`
+### Why This Architecture?
+
+1. **Simple sync WebSocket** — No complex async event loops (proven problematic in Blender)
+2. **JSON protocol** — Debuggable, no binary framing overhead
+3. **No TLS/auth** — Tailscale handles encryption & authentication at VPN level
+4. **6 message types** — Minimal protocol (vs 25+ in over-engineered version)
+5. **~800 lines total** — Rewrite from 6,741 lines of dead code
+
+---
+
+## Quick Start
+
+### Prerequisites
+
+- **Mac:** Blender 4.0+ installed
+- **Windows:** Python 3.9+, Blender CLI available
+- **Both:** Tailscale VPN with mutual access
+
+### 1. Windows: Start Server
+
+```bash
+# Option A: Run directly
+cd blender-remote-gpu
+python server/server.py --port 9876
+
+# Option B: Use batch file (Windows)
+start_server.bat
+```
+
+**Output should show:**
+```
+[Server] Starting on 0.0.0.0:9876
+[Server] GPU: NVIDIA GeForce RTX 5090 (24576 MB free)
+[Server] Waiting for client connections...
+```
+
+### 2. Mac: Install Addon
+
+1. Download the addon ZIP from GitHub releases
+2. In Blender 5.0: **Edit → Preferences → Add-ons → Install**
+3. Select `blender_remote_gpu_addon.zip`
+4. Enable the addon: check “Blender Remote GPU”
+
+### 3. Mac: Connect in Blender
+
+1. Open Blender preferences addon panel (should auto-show)
+2. Verify server IP = `100.74.135.83`, port = `9876`
+3. Click **[Connect]**
+4. You should see: `Connected — RTX 5090 (24576 MB free)`
+
+### 4. Test Render
+
+1. Open any .blend scene (or create a simple one)
+2. Switch to **Cycles** render engine (Remote GPU requires it)
+3. Press **F12** to render
+4. Watch the image render on Windows, display on Mac
+
+---
+
+## Troubleshooting
+
+### “Connection timeout” in Blender
+
+**Checklist:**
+- [ ] Windows server running? Check console for `[Server] Waiting for client connections...`
+- [ ] Tailscale active on both machines? Run `tailscale status` on Mac
+- [ ] Windows machine shows `active` and reachable?
+- [ ] Firewall blocking port 9876 on Windows?
+
+**Test connectivity from Mac:**
+```bash
+python3 << ‘EOF’
+from websockets.sync.client import connect
+import json
+
+try:
+    ws = connect(“ws://100.74.135.83:9876”, open_timeout=5)
+    ws.send(json.dumps({“type”: “ping”}))
+    print(“✓ Handshake:”, ws.recv())
+    ws.close()
+except Exception as e:
+    print(“✗ Error:”, e)
+EOF
+```
+
+### Addon fails to load
+
+**Issue:** `ImportError: No module named ‘websockets’`
+
+**Solution:** Addon auto-installs websockets on first load. If that fails:
+```bash
+pip install websockets
+```
+
+Or manually install to addon:
+```bash
+cd ~/.config/blender/5.0/scripts/addons/addon
+pip install --target modules websockets
+```
+
+### Render hangs
+
+**Check Windows server logs:**
+- Is the Blender executable path correct? (Server tries: `C:\Program Files\Blender Foundation\Blender 4.1\blender.exe`, etc.)
+- Is scene file valid .blend?
+- GPU overheating? Check VRAM usage: `nvidia-smi`
+
+---
+
+## Protocol
+
+All messages are JSON text frames over WebSocket, optionally followed by binary data.
+
+### Client → Server
+
+```json
+{“type”: “ping”}
+```
+Check if server is alive.
+
+```json
+{
+  “type”: “scene_upload”,
+  “filename”: “scene.blend”,
+  “size”: 12345
+}
+```
+Followed by binary frame with .blend file bytes.
+
+```json
+{
+  “type”: “render_start”,
+  “width”: 1920,
+  “height”: 1080,
+  “samples”: 128
+}
+```
+Start rendering the uploaded scene.
+
+```json
+{“type”: “render_cancel”}
+```
+Cancel current render.
+
+### Server → Client
+
+```json
+{
+  “type”: “pong”,
+  “gpu”: “NVIDIA GeForce RTX 5090”,
+  “vram_free”: 24576
+}
+```
+Response to ping. GPU name and free VRAM in MB.
+
+```json
+{
+  “type”: “scene_ack”
+}
+```
+Scene received and saved.
+
+```json
+{
+  “type”: “progress”,
+  “samples_done”: 64,
+  “samples_total”: 128,
+  “message”: “Rendering...”
+}
+```
+Render progress updates.
+
+```json
+{
+  “type”: “frame”,
+  “width”: 1920,
+  “height”: 1080,
+  “format”: “png”
+}
+```
+Followed by binary frame with PNG image bytes.
+
+```json
+{
+  “type”: “error”,
+  “message”: “Render failed: Blender not found”
+}
+```
+Error occurred.
+
+---
+
+## File Structure
+
+```
+blender-remote-gpu/
+├── addon/
+│   ├── __init__.py          # Registration, package bootstrap
+│   ├── preferences.py       # UI: IP, Port, Connect button
+│   ├── operators.py         # OT_connect, OT_disconnect operators
+│   ├── connection.py        # Threaded sync WebSocket client
+│   ├── engine.py            # RenderEngine: final render only
+│   └── modules/             # websockets installs here
+├── server/
+│   ├── server.py            # WebSocket server, message routing
+│   └── renderer.py          # Blender subprocess rendering
+├── shared/
+│   └── protocol.py          # Message type constants
+├── start_server.bat         # Windows batch launcher
+└── README.md                # This file
+```
+
+---
+
+## Development
+
+### Running from Source
+
+**Server (Windows):**
+```bash
+cd blender-remote-gpu
+python server/server.py --port 9876
+```
+
+**Addon (Mac):**
+1. Symlink to Blender addons folder:
+   ```bash
+   ln -s ~/Downloads/blender-remote-gpu/addon ~/.config/blender/5.0/scripts/addons/addon
+   ```
+2. Restart Blender
+3. Enable in Preferences
+
+### Testing
+
+Run connectivity test from Mac:
+```bash
+python3 << ‘EOF’
+from websockets.sync.client import connect
+import json
+ws = connect(“ws://100.74.135.83:9876”, open_timeout=10)
+ws.send(json.dumps({“type”: “ping”}))
+print(“Pong:”, ws.recv())
+ws.close()
+EOF
+```
+
+---
+
+## Known Limitations
+
+1. **Phase 1 only (final render)** — Live viewport streaming coming in Phase 2
+2. **Tailscale-only** — Requires VPN to be running and connected
+3. **Single scene at a time** — Server stores one .blend, renders one at a time
+4. **No render resume** — Render cancellation stops immediately, no checkpoints
+5. **No compositor** — Compositor nodes not supported yet (Phase 3)
+
+---
+
+## Roadmap
+
+- [x] **Phase 1:** Final render (F12) ✓
+- [ ] **Phase 2:** Live viewport streaming (camera orbit, progressive samples)
+- [ ] **Phase 3:** Compositor support
+- [ ] **Phase 4:** Multi-GPU load balancing
+- [ ] **Phase 5:** Web interface for server monitoring
+
+---
+
+## Credits
+
+Built with:
+- **Blender 5.0 Python API**
+- **WebSockets** (sync client)
+- **Tailscale VPN**
+
+Original concept: Interactive GPU rendering over VPN for Mac ↔ Windows pipeline.
+
+---
+
+## License
+
+MIT
+
+---
+
+## Support
+
+For issues:
+1. Check **Troubleshooting** section above
+2. Review Windows server logs
+3. Run connectivity test
+4. File issue on GitHub with:
+   - `blender --version`
+   - `python --version`
+   - `tailscale status`
+   - Full error message from Blender console
