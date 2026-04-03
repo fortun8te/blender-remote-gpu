@@ -1,16 +1,22 @@
-"""Remote GPU Render — offload Cycles rendering to a remote GPU over HTTP."""
+"""Remote GPU Render — offload Cycles rendering to a remote GPU over HTTP.
 
-__version__ = "1.0.24"
-BUILD = "b24"
+b25: Dual-viewport architecture
+  - Left viewport: normal Blender (Solid mode, 60fps, Mac GPU)
+  - Right viewport: live rendered preview from remote RTX GPU
+  - No more "watching a video" — navigate normally, rendered view updates alongside
+"""
+
+__version__ = "1.0.25"
+BUILD = "b25"
 BUILD_DATE = "2026-04-03"
 
 bl_info = {
     "name": "Remote GPU Render",
     "author": "Michael Knaap",
-    "version": (1, 0, 24),
+    "version": (1, 0, 25),
     "blender": (4, 0, 0),
-    "location": "Render Properties > Render Engine > Remote GPU",
-    "description": "Render on a remote GPU server over your network",
+    "location": "3D Viewport > N-Panel > Remote GPU",
+    "description": "Live rendered preview on a remote RTX GPU — dual viewport architecture",
     "category": "Render",
 }
 
@@ -19,19 +25,36 @@ import bpy
 from . import engine
 from . import preferences
 from . import operators
+from . import live_preview
 
 classes = [
+    # Preferences
     preferences.RemoteGPUPreferences,
+
+    # Render engine
+    engine.RemoteRenderEngine,
+
+    # Render properties panel
+    preferences.REMOTEGPU_PT_render_panel,
+
+    # 3D viewport N-panel
+    preferences.REMOTEGPU_PT_sidebar,
+
+    # Connection operators
     operators.REMOTEGPU_OT_connect,
     operators.REMOTEGPU_OT_disconnect,
     operators.REMOTEGPU_OT_test_connection,
-    engine.RemoteRenderEngine,
-    preferences.REMOTEGPU_PT_render_panel,
+
+    # Live preview operators
+    live_preview.REMOTEGPU_OT_upload_scene,
+    live_preview.REMOTEGPU_OT_set_preview_viewport,
+    live_preview.REMOTEGPU_OT_start_live_preview,
+    live_preview.REMOTEGPU_OT_stop_live_preview,
 ]
 
 
 def _get_compatible_panels():
-    """Get all standard Blender panels that should show for our engine."""
+    """Get standard Blender panels that should show for our render engine."""
     exclude = {
         'VIEWLAYER_PT_filter',
         'VIEWLAYER_PT_layer_passes',
@@ -56,14 +79,20 @@ def register():
         panel.COMPAT_ENGINES.add('REMOTE_GPU')
 
     print(f"[RemoteGPU] Addon registered (v{__version__} {BUILD})")
+    print(f"[RemoteGPU] Open 3D Viewport > N-Panel > Remote GPU tab to start")
 
 
 def unregister():
+    # Stop live preview if running
+    if live_preview.is_active():
+        live_preview.stop_preview()
+
+    # Disconnect if connected
     if engine.RemoteRenderEngine._connection:
         engine.RemoteRenderEngine._connection.close()
         engine.RemoteRenderEngine._connection = None
 
-    # Remove our engine from standard panels
+    # Remove from standard panels
     for panel in _get_compatible_panels():
         if 'REMOTE_GPU' in panel.COMPAT_ENGINES:
             panel.COMPAT_ENGINES.discard('REMOTE_GPU')
@@ -73,6 +102,7 @@ def unregister():
             bpy.utils.unregister_class(cls)
         except Exception:
             pass
+
     print("[RemoteGPU] Addon unregistered")
 
 
