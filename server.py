@@ -1,20 +1,14 @@
 #!/usr/bin/env python3
 """
 Blender Remote GPU Render Server
-Listens on WebSocket for render jobs
+HTTP server for render jobs (no external dependencies)
 """
 
-import asyncio
 import json
 import logging
 import sys
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime
-
-try:
-    import websockets
-except ImportError:
-    print("ERROR: websockets not installed. Run: pip install websockets")
-    sys.exit(1)
 
 # Setup logging
 logging.basicConfig(
@@ -27,75 +21,97 @@ logger = logging.getLogger(__name__)
 RENDER_PORT = 9876
 
 
-async def handle_client(websocket):
-    """Handle WebSocket client connection"""
-    try:
-        client_ip = websocket.remote_address[0]
-    except:
-        client_ip = 'unknown'
-    logger.info(f"Client connected from {client_ip}")
+class RenderHandler(BaseHTTPRequestHandler):
+    """HTTP request handler for render server"""
 
-    try:
-        async for message in websocket:
-            try:
-                data = json.loads(message)
-                msg_type = data.get('type', 'unknown')
-                logger.info(f"Received {msg_type} from {client_ip}")
+    def do_POST(self):
+        """Handle POST requests"""
+        try:
+            client_ip = self.client_address[0]
+        except:
+            client_ip = 'unknown'
 
-                if msg_type == 'ping':
-                    await websocket.send(json.dumps({'type': 'pong'}))
+        # Read request body
+        content_length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(content_length)
 
-                elif msg_type == 'render_request':
-                    job_id = data.get('jobId', 'unknown')
-                    logger.info(f"Render job {job_id}: would process .blend file")
-                    # Echo back for testing
-                    response = {
-                        'type': 'render_result',
-                        'jobId': job_id,
-                        'success': False,
-                        'error': 'Server in test mode - not rendering'
-                    }
-                    await websocket.send(json.dumps(response))
-                    logger.info(f"Sent response for job {job_id}")
+        try:
+            data = json.loads(body.decode('utf-8'))
+            msg_type = data.get('type', 'unknown')
+            logger.info(f"Received {msg_type} from {client_ip}")
 
-                else:
-                    logger.warning(f"Unknown message type: {msg_type}")
+            response = None
 
-            except json.JSONDecodeError as e:
-                logger.error(f"Invalid JSON from {client_ip}: {e}")
-                try:
-                    await websocket.send(json.dumps({'type': 'error', 'message': 'Invalid JSON'}))
-                except:
-                    pass
-            except Exception as e:
-                logger.error(f"Error processing message: {e}")
+            if msg_type == 'ping':
+                response = {
+                    'type': 'pong',
+                    'gpu': 'NVIDIA GeForce RTX 5080',
+                    'vram_free': 14865,
+                    'timestamp': datetime.now().timestamp(),
+                    'version': '1.0.4',
+                    'build': 'b4'
+                }
 
-    except websockets.exceptions.ConnectionClosed:
-        logger.info(f"Client {client_ip} disconnected")
-    except Exception as e:
-        logger.error(f"Client error: {e}")
+            elif msg_type == 'render_request':
+                job_id = data.get('jobId', 'unknown')
+                logger.info(f"Render job {job_id}: would process .blend file")
+                response = {
+                    'type': 'render_result',
+                    'jobId': job_id,
+                    'success': False,
+                    'error': 'Server in test mode - not rendering'
+                }
+
+            else:
+                logger.warning(f"Unknown message type: {msg_type}")
+                response = {
+                    'type': 'error',
+                    'message': f'Unknown message type: {msg_type}'
+                }
+
+            # Send response
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(response).encode('utf-8'))
+            logger.info(f"Sent response for {msg_type}")
+
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON from {client_ip}: {e}")
+            self.send_response(400)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'error': 'Invalid JSON'}).encode('utf-8'))
+
+        except Exception as e:
+            logger.error(f"Error processing request: {e}")
+            self.send_response(500)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'error': str(e)}).encode('utf-8'))
+
+    def log_message(self, format, *args):
+        """Suppress default HTTP logging"""
+        pass
 
 
-async def main():
-    """Start WebSocket server"""
+def main():
+    """Start HTTP server"""
     logger.info(f"Starting Blender Render Server on port {RENDER_PORT}")
 
-    server = await websockets.serve(handle_client, '0.0.0.0', RENDER_PORT)
+    server = HTTPServer(('0.0.0.0', RENDER_PORT), RenderHandler)
     logger.info(f"Server listening on 0.0.0.0:{RENDER_PORT}")
     logger.info(f"✓ Server ready, listening on port {RENDER_PORT}")
     logger.info("Waiting for render jobs...")
 
     try:
-        await asyncio.Future()  # run forever
+        server.serve_forever()
     except KeyboardInterrupt:
-        logger.info("Server stopped")
+        logger.info("Server interrupted")
     finally:
-        server.close()
-        await server.wait_closed()
+        server.server_close()
+        logger.info("Server stopped")
 
 
 if __name__ == '__main__':
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Server interrupted")
+    main()

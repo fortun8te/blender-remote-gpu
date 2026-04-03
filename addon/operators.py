@@ -27,7 +27,7 @@ class REMOTEGPU_OT_connect(bpy.types.Operator):
 
         # Connect
         from .connection import Connection
-        url = f"ws://{prefs.server_ip}:{prefs.server_port}"
+        url = f"http://{prefs.server_ip}:{prefs.server_port}"
         conn = Connection(url)
         conn.connect()
 
@@ -74,7 +74,7 @@ class REMOTEGPU_OT_test_connection(bpy.types.Operator):
 
         # Test connection without storing it
         from .connection import Connection
-        url = f"ws://{prefs.server_ip}:{prefs.server_port}"
+        url = f"http://{prefs.server_ip}:{prefs.server_port}"
         test_conn = Connection(url)
 
         print(f"[RemoteGPU] Testing connection to {url}...")

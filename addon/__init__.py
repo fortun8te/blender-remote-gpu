@@ -1,9 +1,9 @@
-"""Remote GPU Render -- offload Cycles rendering to a remote GPU over WebSocket."""
+"""Remote GPU Render -- offload Cycles rendering to a remote GPU over HTTP."""
 
 # Version scheme: (major, minor, patch) where patch indicates build
 # b1 = 1.0.1, b2 = 1.0.2, b3 = 1.0.3, b4 = 1.0.4, etc.
-__version__ = "1.0.11"
-BUILD = "b11"
+__version__ = "1.0.13"
+BUILD = "b13"
 BUILD_DATE = "2026-04-03"
 
 bl_info = {
@@ -19,58 +19,14 @@ bl_info = {
 }
 
 import bpy
-import sys
-import os
-import subprocess
 
-# Bootstrap: ensure websockets is available
-ADDON_DIR = os.path.dirname(os.path.abspath(__file__))
-MODULES_DIR = os.path.join(ADDON_DIR, "modules")
-
-
-def _ensure_packages():
-    """Install websockets to addon/modules/ if not already available."""
-    # Add modules dir to path using BOTH methods for Blender compatibility
-    if MODULES_DIR not in sys.path:
-        sys.path.insert(0, MODULES_DIR)
-
-    # Use site.addsitedir() for proper .pth support in Blender's Python
-    import site
-    site.addsitedir(MODULES_DIR)
-    print(f"[RemoteGPU] Added to sys.path: {MODULES_DIR}")
-
-    try:
-        import websockets
-        print(f"[RemoteGPU] ✓ websockets loaded successfully")
-        return True
-    except ImportError as e:
-        print(f"[RemoteGPU] ✗ Failed to import websockets: {e}")
-        print(f"[RemoteGPU] sys.path: {sys.path[:3]}")  # Show first 3 paths for debugging
-
-    # Try to install
-    print("[RemoteGPU] Attempting to install websockets package...")
-    try:
-        os.makedirs(MODULES_DIR, exist_ok=True)
-        subprocess.check_call([
-            sys.executable, "-m", "pip", "install",
-            "--target", MODULES_DIR, "--no-user", "--quiet",
-            "websockets",
-        ])
-        print("[RemoteGPU] websockets installed successfully")
-        return True
-    except Exception as e:
-        print(f"[RemoteGPU] Failed to install websockets: {e}")
-        return False
-
-
-# Import addon modules (these don't need websockets at import time)
+# Import addon modules (no external dependencies needed)
 from . import engine
 from . import preferences
 from . import operators
 
 classes = [
     preferences.RemoteGPUPreferences,
-    # preferences.REMOTEGPU_PT_panel,  # TODO: Debug panel registration issue
     operators.REMOTEGPU_OT_connect,
     operators.REMOTEGPU_OT_disconnect,
     operators.REMOTEGPU_OT_test_connection,
@@ -79,9 +35,7 @@ classes = [
 
 
 def register():
-    # Ensure packages before registering
-    _ensure_packages()
-
+    """Register addon classes."""
     for cls in classes:
         try:
             bpy.utils.register_class(cls)
@@ -90,6 +44,7 @@ def register():
 
 
 def unregister():
+    """Unregister addon classes."""
     # Disconnect on unregister
     if engine.RemoteRenderEngine._connection:
         engine.RemoteRenderEngine._connection.close()
