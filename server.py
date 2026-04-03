@@ -226,18 +226,32 @@ def handle_message(data):
             return {"type": "error", "message": "No blend_data"}
 
         if worker_ready:
-            result = send_to_worker({"type": "load_scene", "blend_data": blend_b64}, timeout=60)
-            if result.get("type") == "scene_loaded":
-                return {"type": "scene_cached", "scene_id": "worker",
-                        "objects": result.get("objects", 0)}
-            return result
+            # Tell worker to queue the load (returns immediately as "scene_loading")
+            result = send_to_worker({"type": "load_scene", "blend_data": blend_b64}, timeout=120)
+            if result is None:
+                return {"type": "error", "message": "Worker did not respond to load_scene"}
+
+            if result.get("type") in ("scene_loading", "scene_loaded"):
+                # Poll until the worker's main thread finishes open_mainfile
+                log.info("Scene queued on worker — polling until loaded...")
+                for attempt in range(120):   # up to 60 seconds
+                    time.sleep(0.5)
+                    ping = send_to_worker({"type": "ping"}, timeout=5)
+                    if ping and ping.get("scene_loaded"):
+                        log.info(f"Worker scene ready (took ~{attempt * 0.5:.1f}s)")
+                        return {"type": "scene_cached", "scene_id": "worker",
+                                "objects": 0}
+                return {"type": "error", "message": "Worker scene load timed out (60s)"}
+
+            return result  # pass through any error
         else:
-            # Fallback: save to disk
+            # Fallback: save to disk (no persistent worker)
             scene_id = str(uuid.uuid4())[:8]
             blend_data = base64.b64decode(blend_b64)
             path = os.path.join(tempfile.gettempdir(), f"scene_{scene_id}.blend")
             with open(path, "wb") as f:
                 f.write(blend_data)
+            log.info(f"Scene saved to disk (no worker): {path}")
             return {"type": "scene_cached", "scene_id": scene_id}
 
     # ── Camera-only update (no render) — b24 addition ──
