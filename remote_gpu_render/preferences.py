@@ -57,3 +57,56 @@ class RemoteGPUPreferences(bpy.types.AddonPreferences):
             col = status_box.column(align=True)
             col.operator("remotegpu.connect", text="Connect", icon="PLAY")
             col.operator("remotegpu.test_connection", text="Test Connection", icon="FILE_REFRESH")
+
+
+class REMOTEGPU_PT_render_panel(bpy.types.Panel):
+    """Panel in Render Properties when Remote GPU engine is selected."""
+    bl_label = "Remote GPU"
+    bl_idname = "REMOTEGPU_PT_render_panel"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context = "render"
+
+    @classmethod
+    def poll(cls, context):
+        return context.engine == "REMOTE_GPU"
+
+    def draw(self, context):
+        layout = self.layout
+
+        # Get preferences
+        addon = context.preferences.addons.get(__package__)
+        if not addon:
+            layout.label(text="Enable addon in preferences", icon="ERROR")
+            return
+        prefs = addon.preferences
+
+        # Server settings
+        box = layout.box()
+        box.label(text="Server", icon="URL")
+        row = box.row(align=True)
+        row.prop(prefs, "server_ip", text="IP")
+        row.prop(prefs, "server_port", text="Port")
+
+        # Connection status + buttons
+        from . import engine
+        conn = engine.RemoteRenderEngine._connection
+
+        if conn and conn.connected:
+            status_box = layout.box()
+            row = status_box.row()
+            row.label(text=f"CONNECTED — {conn.gpu_name}", icon="CHECKMARK")
+            if conn.vram_free > 0:
+                status_box.label(text=f"VRAM: {conn.vram_free} MB free")
+            status_box.label(text=f"Latency: {conn.latency_ms}ms ({conn.method})")
+            status_box.operator("remotegpu.disconnect", text="Disconnect", icon="CANCEL")
+        else:
+            status_box = layout.box()
+            row = status_box.row()
+            row.label(text="NOT CONNECTED", icon="ERROR")
+            if conn and conn.error:
+                status_box.label(text=f"Error: {conn.error}")
+            col = status_box.column(align=True)
+            col.scale_y = 1.5
+            col.operator("remotegpu.connect", text="Connect to Server", icon="URL")
+            col.operator("remotegpu.test_connection", text="Test Connection", icon="FILE_REFRESH")

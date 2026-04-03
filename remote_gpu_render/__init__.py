@@ -1,7 +1,7 @@
 """Remote GPU Render — offload Cycles rendering to a remote GPU over HTTP."""
 
-__version__ = "1.0.18"
-BUILD = "b18"
+__version__ = "1.0.19"
+BUILD = "b19"
 BUILD_DATE = "2026-04-03"
 
 bl_info = {
@@ -26,6 +26,7 @@ classes = [
     operators.REMOTEGPU_OT_disconnect,
     operators.REMOTEGPU_OT_test_connection,
     engine.RemoteRenderEngine,
+    preferences.REMOTEGPU_PT_render_panel,
 ]
 
 
