@@ -1,102 +1,89 @@
-"""Remote GPU Render — Blender addon that offloads Cycles rendering to a remote GPU."""
+"""Remote GPU Render -- offload Cycles rendering to a remote GPU over WebSocket."""
 
 bl_info = {
     "name": "Remote GPU Render",
     "author": "Michael Knaap",
-    "version": (0, 2, 0),
+    "version": (1, 0, 0),
     "blender": (4, 0, 0),
-    "location": "Render Engine Dropdown",
-    "description": "Seamless Cycles rendering on a remote GPU — same workflow, faster results",
+    "location": "Render Properties > Render Engine > Remote GPU",
+    "description": "Render on a remote GPU server over your network",
     "category": "Render",
 }
 
 import bpy
 import sys
-from pathlib import Path
+import os
+import subprocess
 
+# Bootstrap: ensure websockets is available
+ADDON_DIR = os.path.dirname(os.path.abspath(__file__))
+MODULES_DIR = os.path.join(ADDON_DIR, "modules")
+
+
+def _ensure_packages():
+    """Install websockets to addon/modules/ if not already available."""
+    # Add modules dir to path
+    if MODULES_DIR not in sys.path:
+        sys.path.insert(0, MODULES_DIR)
+
+    try:
+        import websockets
+        return True
+    except ImportError:
+        pass
+
+    # Try to install
+    print("[RemoteGPU] Installing websockets package...")
+    try:
+        os.makedirs(MODULES_DIR, exist_ok=True)
+        subprocess.check_call([
+            sys.executable, "-m", "pip", "install",
+            "--target", MODULES_DIR, "--no-user", "--quiet",
+            "websockets",
+        ])
+        print("[RemoteGPU] websockets installed successfully")
+        return True
+    except Exception as e:
+        print(f"[RemoteGPU] Failed to install websockets: {e}")
+        return False
+
+
+# Import addon modules (these don't need websockets at import time)
 from . import engine
 from . import preferences
-
-# Try to load dev config for fast iteration
-try:
-    sys.path.insert(0, str(Path(__file__).parent.parent))
-    from shared import dev_config
-    HAS_DEV_CONFIG = True
-except (ImportError, AttributeError):
-    HAS_DEV_CONFIG = False
-    dev_config = None
-
+from . import operators
 
 classes = [
     preferences.RemoteGPUPreferences,
-    preferences.REMOTEGPU_PT_connection_panel,
-    preferences.REMOTEGPU_OT_connect,
-    preferences.REMOTEGPU_OT_disconnect,
-    preferences.REMOTEGPU_OT_select_device,  # Agent 4 — GPU Backend Selection
+    preferences.REMOTEGPU_PT_panel,
+    operators.REMOTEGPU_OT_connect,
+    operators.REMOTEGPU_OT_disconnect,
     engine.RemoteRenderEngine,
 ]
 
 
 def register():
-    try:
-        for cls in classes:
-            try:
-                bpy.utils.register_class(cls)
-            except Exception as e:
-                print(f"[RemoteGPU] Failed to register {cls.__name__}: {e}")
-    except Exception as e:
-        print(f"[RemoteGPU] Registration error: {e}")
-        return
+    # Ensure packages before registering
+    _ensure_packages()
 
-    # Auto-connect on startup if dev_config available and AUTO_CONNECT=True
-    if HAS_DEV_CONFIG and dev_config and getattr(dev_config, 'AUTO_CONNECT', False):
+    for cls in classes:
         try:
-            ip = dev_config.REMOTE_SERVER_IP
-            port = dev_config.REMOTE_SERVER_PORT
-            use_tls = getattr(dev_config, 'USE_TLS', False)
-            api_key = getattr(dev_config, 'API_KEY', None)
-
-            print(f"[RemoteGPU] Auto-connecting to {ip}:{port} (TLS={'on' if use_tls else 'off'})")
-            try:
-                # Set preferences from dev_config (addon folder name is "addon" when installed from ZIP)
-                addon_name = __name__ if __name__ else "addon"
-                prefs = bpy.context.preferences.addons[addon_name].preferences
-                prefs.server_ip = ip
-                prefs.server_port = port
-                if hasattr(prefs, 'denoiser_type'):
-                    prefs.denoiser_type = dev_config.DEFAULT_DENOISER
-                if hasattr(prefs, 'denoiser_intensity'):
-                    prefs.denoiser_intensity = dev_config.DEFAULT_DENOISER_INTENSITY
-                if hasattr(prefs, 'viewport_quality'):
-                    prefs.viewport_quality = getattr(dev_config, 'VIEWPORT_QUALITY', 75)
-
-                # Build URL with correct protocol
-                protocol = "wss" if use_tls else "ws"
-                url = f"{protocol}://{ip}:{port}"
-
-                # Connect
-                from . import connection
-                conn = connection.Connection(url, api_key=api_key, use_tls=use_tls)
-                conn.connect()
-                with engine.RemoteRenderEngine._connection_lock:
-                    engine.RemoteRenderEngine._connection = conn
-                engine.RemoteRenderEngine.reset_session_state()
-                print(f"[RemoteGPU] Connected to {ip}:{port}")
-            except Exception as e:
-                print(f"[RemoteGPU] Auto-connect failed: {e}")
+            bpy.utils.register_class(cls)
         except Exception as e:
-            print(f"[RemoteGPU] Config error: {e}")
+            print(f"[RemoteGPU] Failed to register {cls.__name__}: {e}")
 
 
 def unregister():
-    with engine.RemoteRenderEngine._connection_lock:
-        if engine.RemoteRenderEngine._connection is not None:
-            engine.RemoteRenderEngine._connection.close()
-            engine.RemoteRenderEngine._connection = None
-    engine.RemoteRenderEngine.reset_session_state()
+    # Disconnect on unregister
+    if engine.RemoteRenderEngine._connection:
+        engine.RemoteRenderEngine._connection.close()
+        engine.RemoteRenderEngine._connection = None
 
     for cls in reversed(classes):
-        bpy.utils.unregister_class(cls)
+        try:
+            bpy.utils.unregister_class(cls)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
