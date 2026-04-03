@@ -4,6 +4,7 @@ import json
 import threading
 import queue
 import time
+import random
 
 # Lazy import -- websockets loaded only when connect() is called
 _ws_module = None
@@ -40,6 +41,11 @@ class Connection:
         self._binary_queue = queue.Queue()
         self._stop = threading.Event()
         self._thread = None
+
+        # Backoff state for reconnection (FIX #2)
+        self._reconnect_delay = 0.5  # Start at 500ms
+        self._reconnect_delay_max = 30.0  # Cap at 30s
+        self._reconnect_backoff = 2.0  # Double each attempt
 
     def connect(self):
         """Start connection in background thread."""
@@ -89,6 +95,20 @@ class Connection:
         except queue.Empty:
             return None
 
+    def _handle_binary_frame(self, frame):
+        """Validate and buffer incoming binary frames (FIX #3)."""
+        if len(frame) > 500 * 1024 * 1024:
+            print(f"[Connection] ERROR: Binary frame exceeds max size: {len(frame)} bytes")
+            self.connected = False
+            return
+
+        if len(frame) == 0:
+            print(f"[Connection] WARNING: Received empty binary frame")
+            return
+
+        self._binary_queue.put(bytes(frame))
+        print(f"[Connection] Received binary frame: {len(frame)} bytes")
+
     def _worker(self):
         """Background thread: connect, send/receive, auto-reconnect."""
         connect_fn = _get_ws()
@@ -106,8 +126,16 @@ class Connection:
                 self.error = f"Connection failed: {e}"
                 print(f"[Connection] {self.error}")
                 self.connected = False
-                # Retry after 2 seconds
-                if not self._stop.wait(2.0):
+                # FIX #2: Exponential backoff with jitter
+                delay = min(self._reconnect_delay, self._reconnect_delay_max)
+                jitter = delay * random.uniform(0, 0.1)
+                wait_time = delay + jitter
+                print(f"[Connection] Retrying in {wait_time:.2f}s (backoff: {delay:.2f}s)...")
+                if not self._stop.wait(wait_time):
+                    self._reconnect_delay = min(
+                        self._reconnect_delay * self._reconnect_backoff,
+                        self._reconnect_delay_max
+                    )
                     continue
                 return
 
@@ -119,13 +147,17 @@ class Connection:
                 if pong.get("type") == "pong":
                     self.gpu_name = pong.get("gpu", "Unknown")
                     self.vram_free = pong.get("vram_free", 0)
-                    self.connected = True
                     self.error = ""
                     print(f"[Connection] Connected! GPU: {self.gpu_name}")
+                    # FIX #2: Reset backoff on successful connection
+                    self._reconnect_delay = 0.5
                 else:
                     self.error = "Unexpected server response"
                     ws.close()
                     continue
+
+                # FIX #1: Set connected flag ONLY when entering main loop
+                self.connected = True
 
                 # Main send/receive loop
                 while not self._stop.is_set() and self.connected:
@@ -148,7 +180,8 @@ class Connection:
                     try:
                         msg = ws.recv(timeout=0.05)
                         if isinstance(msg, bytes):
-                            self._binary_queue.put(msg)
+                            # FIX #3: Use validation method for binary frames
+                            self._handle_binary_frame(msg)
                         else:
                             self._recv_queue.put(json.loads(msg))
                     except TimeoutError:
@@ -156,12 +189,19 @@ class Connection:
                     except Exception as e:
                         print(f"[Connection] Recv error: {e}")
                         self.connected = False
+                        self.error = f"Recv failed: {e}"
+                        # FIX #3: Explicit close on error
+                        try:
+                            ws.close()
+                        except:
+                            pass
                         break
 
             except Exception as e:
                 print(f"[Connection] Error: {e}")
                 self.connected = False
             finally:
+                # FIX #7: Ensure close is called on all error paths
                 try:
                     ws.close()
                 except Exception:
@@ -169,8 +209,16 @@ class Connection:
 
             # If we got here without stop, try reconnecting
             if not self._stop.is_set():
-                print("[Connection] Reconnecting in 2s...")
-                self._stop.wait(2.0)
+                # FIX #2: Apply backoff to reconnection delay in main loop
+                delay = min(self._reconnect_delay, self._reconnect_delay_max)
+                jitter = delay * random.uniform(0, 0.1)
+                wait_time = delay + jitter
+                print(f"[Connection] Reconnecting in {wait_time:.2f}s...")
+                self._stop.wait(wait_time)
+                self._reconnect_delay = min(
+                    self._reconnect_delay * self._reconnect_backoff,
+                    self._reconnect_delay_max
+                )
 
         self.connected = False
         print("[Connection] Worker stopped.")
