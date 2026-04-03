@@ -168,14 +168,10 @@ class RemoteRenderEngine(bpy.types.RenderEngine):
             if msg.get("type") == "error":
                 error_msg = msg.get("message", "Unknown error")
                 self.report({"ERROR"}, f"Server error: {error_msg}")
-
-                # UI/UX Improvement #2: Map error to user-friendly message
-                from .preferences import get_error_recovery
-                recovery = get_error_recovery(error_msg)
-                print(f"[Engine] Error recovery: {recovery['title']}")
+                print(f"[Engine] Server reported error: {error_msg}")
 
                 RemoteRenderEngine._render_progress_data["active"] = False
-                RemoteRenderEngine._render_progress_data["status"] = f"Error: {recovery['title']}"
+                RemoteRenderEngine._render_progress_data["status"] = f"Error: {error_msg}"
                 return None
             if msg.get("type") == "progress":
                 # UI/UX Improvement #3: Update progress display
