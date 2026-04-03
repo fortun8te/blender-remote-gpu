@@ -66,6 +66,9 @@ classes = [
     preferences.REMOTEGPU_PT_panel,
     operators.REMOTEGPU_OT_connect,
     operators.REMOTEGPU_OT_disconnect,
+    operators.REMOTEGPU_OT_quick_test,          # UI/UX Improvement #4
+    operators.REMOTEGPU_OT_copy_address,        # UI/UX Improvement #1
+    operators.REMOTEGPU_OT_cancel_render,       # UI/UX Improvement #3
     engine.RemoteRenderEngine,
 ]
 

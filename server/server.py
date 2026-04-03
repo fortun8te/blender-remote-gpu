@@ -26,6 +26,10 @@ from shared.protocol import (
     DEFAULT_HOST, DEFAULT_PORT,
 )
 
+# UI/UX: Server version constants (sync with addon __init__.py)
+SERVER_VERSION = "1.0.4"
+SERVER_BUILD = "b4"
+
 # Detect GPU name
 GPU_NAME = "Unknown GPU"
 try:
@@ -141,6 +145,9 @@ class RenderServer:
                 "gpu": GPU_NAME,
                 "vram_free": GPU_VRAM_FREE,
                 "timestamp": time.time(),
+                # UI/UX: Include version/build for connection status display
+                "version": SERVER_VERSION,
+                "build": SERVER_BUILD,
             }))
 
         elif msg_type == SCENE_UPLOAD:

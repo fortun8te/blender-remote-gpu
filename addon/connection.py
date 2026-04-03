@@ -47,6 +47,13 @@ class Connection:
         self._reconnect_delay_max = 30.0  # Cap at 30s
         self._reconnect_backoff = 2.0  # Double each attempt
 
+        # UI/UX: Connection metadata tracking (Improvement #1)
+        self.connected_at = None       # Unix timestamp when connected
+        self.latency_ms = 0            # PING → PONG round-trip time (ms)
+        self.server_version = ""       # From PONG: "1.0.4"
+        self.server_build = ""         # From PONG: "b4"
+        self._ping_sent_time = None    # Track PING timing for latency measurement
+
     def connect(self):
         """Start connection in background thread."""
         if self._thread and self._thread.is_alive():
@@ -95,6 +102,25 @@ class Connection:
         except queue.Empty:
             return None
 
+    def get_elapsed_time(self):
+        """Get elapsed connection time in seconds (or 0 if not connected)."""
+        if not self.connected or not self.connected_at:
+            return 0
+        return time.time() - self.connected_at
+
+    def get_elapsed_time_str(self):
+        """Get formatted elapsed connection time (e.g. '3m 42s')."""
+        elapsed = self.get_elapsed_time()
+        if elapsed < 60:
+            return f"{int(elapsed)}s"
+        minutes = int(elapsed // 60)
+        seconds = int(elapsed % 60)
+        if minutes < 60:
+            return f"{minutes}m {seconds}s"
+        hours = int(minutes // 60)
+        minutes = minutes % 60
+        return f"{hours}h {minutes}m"
+
     def _handle_binary_frame(self, frame):
         """Validate and buffer incoming binary frames (FIX #3)."""
         if len(frame) > 500 * 1024 * 1024:
@@ -140,15 +166,27 @@ class Connection:
                 return
 
             try:
-                # Send ping to verify connection
+                # Send ping to verify connection (UI/UX: track latency)
+                self._ping_sent_time = time.time()
                 ws.send(json.dumps({"type": "ping"}))
                 pong_raw = ws.recv(timeout=5.0)
                 pong = json.loads(pong_raw)
                 if pong.get("type") == "pong":
+                    # Calculate latency (ms)
+                    self.latency_ms = int((time.time() - self._ping_sent_time) * 1000)
+
                     self.gpu_name = pong.get("gpu", "Unknown")
                     self.vram_free = pong.get("vram_free", 0)
+
+                    # UI/UX: Extract server version/build (with graceful fallback)
+                    self.server_version = pong.get("version", "")
+                    self.server_build = pong.get("build", "")
+
+                    # UI/UX: Record connection timestamp for elapsed time display
+                    self.connected_at = time.time()
+
                     self.error = ""
-                    print(f"[Connection] Connected! GPU: {self.gpu_name}")
+                    print(f"[Connection] Connected! GPU: {self.gpu_name}, Latency: {self.latency_ms}ms")
                     # FIX #2: Reset backoff on successful connection
                     self._reconnect_delay = 0.5
                 else:
