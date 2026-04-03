@@ -409,38 +409,47 @@ class REMOTEGPU_OT_upload_scene(bpy.types.Operator):
             self.report({'ERROR'}, "Not connected — connect first")
             return {'CANCELLED'}
 
-        self.report({'INFO'}, "Saving and uploading scene...")
+        # bpy.ops MUST run on the main thread — save scene here in execute(),
+        # then pass base64 data to the background thread for the HTTP upload.
+        import tempfile, os, base64 as b64
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".blend", delete=False)
+        tmp.close()
+        try:
+            bpy.ops.wm.save_as_mainfile(filepath=tmp.name, copy=True)
+            with open(tmp.name, "rb") as f:
+                blend_b64 = b64.b64encode(f.read()).decode("ascii")
+        except Exception as e:
+            self.report({'ERROR'}, f"Scene save failed: {e}")
+            try:
+                os.unlink(tmp.name)
+            except Exception:
+                pass
+            return {'CANCELLED'}
+        finally:
+            try:
+                os.unlink(tmp.name)
+            except Exception:
+                pass
+
+        size_kb = len(blend_b64) * 3 // 4 // 1024
+        self.report({'INFO'}, f"Uploading scene ({size_kb} KB)...")
         REMOTEGPU_OT_upload_scene._result = None
 
-        def _upload():
+        # Only the HTTP transfer runs in background
+        def _upload(blend_data):
             from . import engine as eng
-            import tempfile, os, base64
-
-            # Save current scene to temp file
-            tmp = tempfile.NamedTemporaryFile(suffix=".blend", delete=False)
-            tmp.close()
-            try:
-                bpy.ops.wm.save_as_mainfile(filepath=tmp.name, copy=True)
-                with open(tmp.name, "rb") as f:
-                    blend_b64 = base64.b64encode(f.read()).decode("ascii")
-            except Exception as e:
-                REMOTEGPU_OT_upload_scene._result = f"Save failed: {e}"
-                return
-            finally:
-                try:
-                    os.unlink(tmp.name)
-                except Exception:
-                    pass
-
-            scene_id = conn.upload_scene(blend_b64)
+            scene_id = conn.upload_scene(blend_data)
             if scene_id:
                 eng.RemoteRenderEngine._scene_id = scene_id
                 eng.RemoteRenderEngine._scene_uploaded = True
                 REMOTEGPU_OT_upload_scene._result = "ok"
             else:
-                REMOTEGPU_OT_upload_scene._result = "Upload failed — check server"
+                REMOTEGPU_OT_upload_scene._result = "Upload failed — check server logs"
 
-        REMOTEGPU_OT_upload_scene._thread = threading.Thread(target=_upload, daemon=True)
+        REMOTEGPU_OT_upload_scene._thread = threading.Thread(
+            target=_upload, args=(blend_b64,), daemon=True
+        )
         REMOTEGPU_OT_upload_scene._thread.start()
 
         self._timer = context.window_manager.event_timer_add(0.1, window=context.window)
@@ -454,7 +463,7 @@ class REMOTEGPU_OT_upload_scene(bpy.types.Operator):
             return {'PASS_THROUGH'}
 
         context.window_manager.event_timer_remove(self._timer)
-        result = REMOTEGPU_OT_upload_scene._result or "Unknown"
+        result = REMOTEGPU_OT_upload_scene._result or "Unknown error"
 
         if result == "ok":
             self.report({'INFO'}, "Scene uploaded — ready for live preview")
