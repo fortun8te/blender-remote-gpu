@@ -1,1019 +1,246 @@
 #!/usr/bin/env python3
 """
-Persistent Blender Render Worker b36 — runs INSIDE Blender, keeps scene in GPU memory.
+Single-Job Blender Render Worker (Agent R2 rewrite)
 
-Launch: blender --background --python render_worker.py
+This worker is invoked as a FRESH Blender subprocess for each render job.
+No persistent state, no HTTP server, no polling — just:
+  1. Start fresh
+  2. Load ONE scene
+  3. Render ONE frame
+  4. Exit clean
 
-b36: EXTREME DEBUG LOGGING - diagnose every step:
-  - Elapsed time tracking for all operations
-  - Per-thread logging with thread names
-  - Memory/thread count tracking
-  - File size and existence checks
-  - Context window debugging
-  - Full exception stack traces
-  - Lock acquisition/release tracking
-  - Event pump status logging
-  - Per-operation timing (open_mainfile, setup_gpu, etc)
-  - HTTP handler detailed logs
-  - Loop state tracking
+Job data is passed via RENDER_JOB_JSON environment variable.
+
+Timeout: Dispatcher kills subprocess after 5 minutes.
+Output: Job prints JSON result to stdout on success, exit(0) on success, exit(1) on error.
+Logging: All diagnostics to /tmp/blender_worker.log with rotation.
 """
-
-import sys
-import os
-import traceback
-from collections import deque
-import signal
-import platform
-import atexit
-import logging
-from logging.handlers import RotatingFileHandler
-
-# Try to import psutil for memory tracking (optional)
-try:
-    import psutil
-except ImportError:
-    psutil = None
-
-# Add user site-packages to path (workaround for Blender's isolated Python)
-user_site = os.path.expanduser(r"~\AppData\Roaming\Python\Python311\site-packages")
-if os.path.exists(user_site) and user_site not in sys.path:
-    sys.path.insert(0, user_site)
 
 import bpy
 import json
-import base64
+import logging
+import os
+import sys
 import tempfile
-import time
-import threading
-import shutil
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import traceback
+import uuid
+from pathlib import Path
+from logging.handlers import RotatingFileHandler
 
-# ── Structured Logging Setup ───────────────────────────────────
-# File-based logging with rotation (10MB per file, keep 5 files)
-_log_dir = tempfile.gettempdir()
-_log_file = os.path.join(_log_dir, "blender_worker.log")
-_formatter = logging.Formatter('[%(asctime)s] [Worker] [%(levelname)s] %(message)s', datefmt='%H:%M:%S')
-_logger = logging.getLogger('blender_worker')
-_logger.setLevel(logging.DEBUG)
+# ── Setup Logging ──────────────────────────────────────
+log_dir = tempfile.gettempdir()
+log_file = os.path.join(log_dir, "blender_worker.log")
 
-# Rotating file handler
+logger = logging.getLogger('blender_worker')
+logger.setLevel(logging.DEBUG)
+
+# Rotating file handler (10MB per file, keep 5 backups)
 try:
-    _file_handler = RotatingFileHandler(_log_file, maxBytes=10*1024*1024, backupCount=5)
-    _file_handler.setFormatter(_formatter)
-    _logger.addHandler(_file_handler)
+    file_handler = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5)
+    file_handler.setFormatter(logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s', datefmt='%H:%M:%S'))
+    logger.addHandler(file_handler)
 except Exception as e:
     print(f"[LOGGING_ERROR] Could not setup file logging: {e}", flush=True)
 
-# Timeout constants (in seconds)
-_TIMEOUT_LOAD_FILE = 60      # Max 60s for open_mainfile
-_TIMEOUT_SETUP_GPU = 15      # Max 15s for GPU detection
-_TIMEOUT_RENDER = 300        # Max 300s (5 min) for render.render()
-_IS_WINDOWS = platform.system() == "Windows"
+# Also log to console for visibility
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s', datefmt='%H:%M:%S'))
+logger.addHandler(console_handler)
 
-WORKER_PORT = int(os.environ.get("WORKER_PORT", "9880"))
+logger.info("=" * 80)
+logger.info("Single-Job Render Worker started (Agent R2 rewrite)")
 
-_scene_loaded   = False
-_scene_loading  = False
-_rendering      = False
-_state_lock     = threading.Lock()  # Protects: _scene_loaded, _scene_loading, _rendering, _compute_type
-_render_lock    = threading.Lock()  # Legacy: kept for bpy.ops calls (Blender context)
-_compute_type   = "NONE"
 
-# Pending scene path — HTTP thread writes, main loop reads
-_pending_path = None
-_pending_lock = threading.Lock()
+# ── Job Execution ──────────────────────────────────────
 
-# Retry queue for failed scene loads
-# Each entry: (path, attempt_count, last_retry_time)
-_load_retry_queue = deque(maxlen=5)  # Max 5 retries per path
-_retry_lock = threading.Lock()
-_retry_backoff_seconds = [0.5, 1.0, 2.0, 4.0, 8.0]  # Exponential backoff per attempt
+def execute_job(job_data: dict) -> dict:
+    """
+    Execute a single render job in isolation.
 
-_start_time = time.time()
+    Job schema:
+    {
+        "type": "render",
+        "scene_path": "/path/to/file.blend",
+        "width": 640,
+        "height": 360,
+        "samples": 4,
+        "frame": 1,
+        "output_dir": "/tmp or specified directory"
+    }
 
-# ── Fallback State Tracking (thread-safe) ────────────────────────
-_fallback_state = {
-    "has_cpu_fallback": False,          # True if GPU failed and we fell back to CPU
-    "samples_degraded": False,          # True if render samples were reduced due to timeout
-    "worker_corrupted": False,          # True if scene load failed and worker state is bad
-    "fallback_transitions": [],         # Log of all fallback state transitions
-}
-_fallback_lock = threading.Lock()
+    Returns dict with:
+    {
+        "status": "success" | "error",
+        "output_path": "path/to/result.png" (on success),
+        "error": "error type" (on failure),
+        "message": "error message" (on failure),
+        "file_size_mb": 0.5 (on success)
+    }
+    """
 
-# ── Metrics Tracking (thread-safe) ─────────────────────────────
-_metrics = {
-    "loads_total": 0,
-    "loads_success": 0,
-    "loads_failed": 0,
-    "renders_total": 0,
-    "renders_success": 0,
-    "errors": [],  # Last 20 errors for diagnostics
-}
-_metrics_lock = threading.Lock()
-_last_metrics_log = time.time()
-_metrics_log_interval = 30  # Log metrics every 30 seconds
+    job_type = job_data.get("type", "unknown")
+    scene_path = job_data.get("scene_path", "")
+    width = job_data.get("width", 640)
+    height = job_data.get("height", 360)
+    samples = job_data.get("samples", 1)
+    frame = job_data.get("frame", 1)
+    output_dir = job_data.get("output_dir", tempfile.gettempdir())
 
-def _elapsed():
-    return f"{time.time() - _start_time:.3f}s"
+    logger.info(f"[JOB] Executing {job_type} render job")
+    logger.info(f"[JOB] Scene: {scene_path}")
+    logger.info(f"[JOB] Resolution: {width}x{height}, Samples: {samples}, Frame: {frame}")
 
-def _log(msg, level="INFO"):
-    """Structured logging with timestamp, component, level, message."""
-    elapsed = _elapsed()
-    tid = threading.current_thread().name
-    formatted_msg = f"[{elapsed}] [Worker] [{tid}] {msg}"
-    print(formatted_msg, flush=True)
     try:
-        _logger.log(getattr(logging, level, logging.INFO), f"[{tid}] {msg}")
-    except Exception:
-        pass
+        # ── Validate Scene Path ────────────────────────────
+        if not scene_path:
+            raise ValueError("No scene_path provided in job")
 
-def _debug(msg):
-    """Extra verbose debug logging"""
-    try:
-        if psutil:
-            proc = psutil.Process()
-            mem = proc.memory_info().rss / 1024 / 1024  # MB
-            _log(f"[DEBUG] {msg} | MEM={mem:.1f}MB | Threads={threading.active_count()}", "DEBUG")
-        else:
-            _log(f"[DEBUG] {msg} | Threads={threading.active_count()}", "DEBUG")
-    except:
-        _log(f"[DEBUG] {msg}", "DEBUG")
+        if not os.path.isfile(scene_path):
+            raise FileNotFoundError(f"Scene file not found: {scene_path}")
 
-def _record_metric(metric_name, success=True, error_msg=None):
-    """Record a metric operation (thread-safe)."""
-    global _last_metrics_log
-    with _metrics_lock:
-        if metric_name == "load":
-            _metrics["loads_total"] += 1
-            if success:
-                _metrics["loads_success"] += 1
-            else:
-                _metrics["loads_failed"] += 1
-        elif metric_name == "render":
-            _metrics["renders_total"] += 1
-            if success:
-                _metrics["renders_success"] += 1
+        logger.info(f"[LOAD] Scene file exists: {os.path.getsize(scene_path) / (1024*1024):.2f} MB")
 
-        # Track errors (keep last 20)
-        if error_msg:
-            _metrics["errors"].append({"timestamp": time.time(), "error": error_msg})
-            if len(_metrics["errors"]) > 20:
-                _metrics["errors"].pop(0)
+        # ── Load Scene ─────────────────────────────────────
+        logger.info(f"[LOAD] Opening {scene_path}...")
+        try:
+            bpy.ops.wm.open_mainfile(filepath=scene_path)
+        except Exception as e:
+            raise RuntimeError(f"Failed to open scene file: {e}")
 
-        # Log metrics summary every 30 seconds
-        if time.time() - _last_metrics_log >= _metrics_log_interval:
-            _log(f"[METRICS] Loads: {_metrics['loads_success']}/{_metrics['loads_total']} success, "
-                 f"Renders: {_metrics['renders_success']}/{_metrics['renders_total']} success, "
-                 f"Recent errors: {len(_metrics['errors'])}", "INFO")
-            _last_metrics_log = time.time()
+        logger.info(f"[LOAD] Scene loaded successfully")
 
+        # ── Set Frame ──────────────────────────────────────
+        if frame != 1:
+            logger.info(f"[SCENE] Setting frame to {frame}")
+            try:
+                bpy.context.scene.frame_set(frame)
+            except Exception as e:
+                logger.warning(f"[SCENE] Could not set frame: {e}")
 
-def _record_fallback(state_name, value, reason=""):
-    """Record a fallback state transition (thread-safe)."""
-    with _fallback_lock:
-        old_value = _fallback_state.get(state_name, False)
-        if old_value != value:
-            _fallback_state[state_name] = value
-            transition = {
-                "timestamp": time.time(),
-                "state": state_name,
-                "old_value": old_value,
-                "new_value": value,
-                "reason": reason,
-            }
-            _fallback_state["fallback_transitions"].append(transition)
-            # Keep last 50 transitions
-            if len(_fallback_state["fallback_transitions"]) > 50:
-                _fallback_state["fallback_transitions"].pop(0)
-            _log(f"[FALLBACK_STATE] {state_name}: {old_value} → {value} | {reason}")
+        # ── Configure Render Settings ──────────────────────
+        logger.info(f"[RENDER] Configuring render settings")
 
+        # Set resolution
+        bpy.context.scene.render.resolution_x = width
+        bpy.context.scene.render.resolution_y = height
+        logger.info(f"[RENDER] Resolution set to {width}x{height}")
 
-def _get_fallback_state():
-    """Get current fallback state (thread-safe)."""
-    with _fallback_lock:
+        # Set samples (if using Cycles engine)
+        if bpy.context.scene.render.engine == 'CYCLES':
+            bpy.context.scene.cycles.samples = samples
+            logger.info(f"[RENDER] Cycles samples set to {samples}")
+
+        # ── Generate Output Path ───────────────────────────
+        os.makedirs(output_dir, exist_ok=True)
+        result_id = str(uuid.uuid4())[:8]
+        output_path = os.path.join(output_dir, f"blender_result_{result_id}.png")
+
+        logger.info(f"[RENDER] Output path: {output_path}")
+        bpy.context.scene.render.filepath = output_path
+        bpy.context.scene.render.image_settings.file_format = "PNG"
+        bpy.context.scene.render.image_settings.color_mode = "RGB"
+
+        # ── Execute Render ─────────────────────────────────
+        logger.info(f"[RENDER] Starting render...")
+        try:
+            bpy.ops.render.render(write_still=True)
+        except Exception as e:
+            raise RuntimeError(f"Render failed: {e}")
+
+        logger.info(f"[RENDER] Render complete")
+
+        # ── Verify Output ──────────────────────────────────
+        if not os.path.isfile(output_path):
+            raise RuntimeError(f"Render output file not created: {output_path}")
+
+        output_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+        logger.info(f"[RENDER] Output verified: {output_size_mb:.2f} MB")
+
         return {
-            "has_cpu_fallback": _fallback_state["has_cpu_fallback"],
-            "samples_degraded": _fallback_state["samples_degraded"],
-            "worker_corrupted": _fallback_state["worker_corrupted"],
-            "recent_transitions": _fallback_state["fallback_transitions"][-5:],  # Last 5 transitions
+            "status": "success",
+            "output_path": output_path,
+            "file_size_mb": output_size_mb,
+            "result_id": result_id,
+        }
+
+    except Exception as e:
+        logger.error(f"[ERROR] Job failed: {type(e).__name__}: {e}")
+        logger.error(f"[ERROR] Traceback:\n{traceback.format_exc()}")
+
+        return {
+            "status": "error",
+            "error": type(e).__name__,
+            "message": str(e),
         }
 
 
-# ── Timeout Handler ───────────────────────────────────────────
-
-def _timeout_handler(signum, frame):
-    """Signal handler for timeout (Unix/Linux only)"""
-    raise TimeoutError("Operation exceeded timeout")
-
-
-def run_with_timeout(func, timeout_sec, operation_name):
-    """
-    Execute func with a timeout.
-    - Unix/Linux: Uses signal.alarm() (cannot timeout blocking Blender ops reliably)
-    - Windows: Uses threading.Timer with best-effort cleanup
-
-    Args:
-        func: Callable to execute
-        timeout_sec: Timeout in seconds
-        operation_name: Human-readable name for logging
-
-    Returns:
-        Result of func() if successful
-
-    Raises:
-        TimeoutError: If operation exceeds timeout_sec
-    """
-    _log(f"[TIMEOUT] Starting '{operation_name}' with {timeout_sec}s timeout")
-
-    if _IS_WINDOWS:
-        # Windows: Use threading.Timer (signal.alarm not available on Windows)
-        result = [None]
-        exception = [None]
-        timer = [None]
-
-        def wrapper():
-            try:
-                result[0] = func()
-            except Exception as e:
-                exception[0] = e
-
-        def on_timeout():
-            _log(f"[TIMEOUT] '{operation_name}' exceeded {timeout_sec}s timeout on Windows")
-            exception[0] = TimeoutError(f"'{operation_name}' exceeded {timeout_sec}s")
-
-        thread = threading.Thread(target=wrapper, daemon=True)
-        thread.start()
-        timer[0] = threading.Timer(timeout_sec, on_timeout)
-        timer[0].daemon = True
-        timer[0].start()
-
-        thread.join(timeout=timeout_sec + 1)  # Wait thread + 1s buffer
-
-        if timer[0].is_alive():
-            timer[0].cancel()
-
-        if exception[0]:
-            raise exception[0]
-        return result[0]
-
-    else:
-        # Unix/Linux: Use signal.alarm()
-        old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
-        signal.alarm(timeout_sec)
-        try:
-            result = func()
-            signal.alarm(0)  # Cancel alarm
-            _log(f"[TIMEOUT_OK] '{operation_name}' completed within {timeout_sec}s")
-            return result
-        except TimeoutError as e:
-            _log(f"[TIMEOUT] '{operation_name}' exceeded {timeout_sec}s: {e}")
-            raise
-        finally:
-            signal.alarm(0)  # Ensure alarm is cancelled
-            signal.signal(signal.SIGALRM, old_handler)
-
-
-def _should_retry_now(last_retry_time, attempt):
-    """
-    Check if enough time has passed for the next retry attempt.
-    attempt is 0-indexed (0 = first retry, 1 = second retry, etc.)
-    """
-    if attempt >= len(_retry_backoff_seconds):
-        return False  # Max retries exceeded
-    backoff = _retry_backoff_seconds[attempt]
-    elapsed = time.time() - last_retry_time
-    return elapsed >= backoff
-
-
-# ── Input Validation ──────────────────────────────────────────
-
-def validate_path(path):
-    """
-    Validate a file path for security and correctness.
-
-    Checks:
-    - path is string type (not None/bytes)
-    - path does not contain path traversal (.. sequences)
-    - path length is within limits (< 500 chars)
-    - path ends with .blend extension
-    - file exists and is readable
-
-    Returns:
-        (is_valid: bool, message: str)
-    """
-    if not isinstance(path, str):
-        return False, "Path must be string, not None/bytes"
-
-    if ".." in path:
-        return False, "Path traversal (..) not allowed"
-
-    if len(path) > 500:
-        return False, f"Path too long ({len(path)} > 500 chars)"
-
-    if not path.endswith(".blend"):
-        return False, "File must have .blend extension"
-
-    if not os.path.isfile(path):
-        return False, "File not found or not readable"
-
-    return True, "OK"
-
-
-def validate_render_params(width, height, samples, quality):
-    """
-    Validate and clamp render parameters to safe ranges.
-
-    Returns:
-        (validated_width, validated_height, validated_samples, validated_quality, message: str)
-    """
-    # Width: 1-7680 (4K limit)
-    try:
-        w = int(width) if width is not None else 640
-        w = max(1, min(7680, w))
-    except (ValueError, TypeError):
-        w = 640
-
-    # Height: 1-7680 (4K limit)
-    try:
-        h = int(height) if height is not None else 360
-        h = max(1, min(7680, h))
-    except (ValueError, TypeError):
-        h = 360
-
-    # Samples: 1-1024
-    try:
-        s = int(samples) if samples is not None else 1
-        s = max(1, min(1024, s))
-    except (ValueError, TypeError):
-        s = 1
-
-    # Quality: 1-100 (JPEG quality)
-    try:
-        q = int(quality) if quality is not None else 75
-        q = max(1, min(100, q))
-    except (ValueError, TypeError):
-        q = 75
-
-    msg = ""
-    if w != width:
-        msg += f"width clamped to {w}; "
-    if h != height:
-        msg += f"height clamped to {h}; "
-    if s != samples:
-        msg += f"samples clamped to {s}; "
-    if q != quality:
-        msg += f"quality clamped to {q}; "
-
-    return w, h, s, q, msg.rstrip("; ") if msg else "OK"
-
-
-# ── GPU setup ─────────────────────────────────────────────────
-
-def _setup_gpu_impl():
-    """Internal GPU setup implementation (to be wrapped with timeout)"""
-    global _compute_type
-    try:
-        prefs = bpy.context.preferences
-        cycles_addon = prefs.addons.get("cycles")
-        if cycles_addon:
-            gpu_success = False
-            # Try OPTIX first, then CUDA, finally fallback to CPU
-            for device_type in ("OPTIX", "CUDA"):
-                try:
-                    cycles_addon.preferences.compute_device_type = device_type
-                    cycles_addon.preferences.get_devices()
-                    devices = list(cycles_addon.preferences.devices)
-                    if devices:
-                        for d in devices:
-                            d.use = True
-                            _log(f"Device: {d.name} ({device_type})")
-                        _compute_type = device_type
-                        _log(f"[GPU_SETUP] Compute: {device_type}")
-                        gpu_success = True
-                        break
-                except Exception as e:
-                    _log(f"[GPU_SETUP] {device_type} unavailable: {e}")
-
-            # If no GPU device found, fall back to CPU
-            if not gpu_success:
-                _log(f"[GPU_FALLBACK] No GPU devices found, falling back to CPU rendering")
-                _compute_type = "CPU"
-                _record_fallback("has_cpu_fallback", True, "No GPU devices available")
-
-        bpy.context.scene.render.engine = "CYCLES"
-        # Set device based on what we detected
-        try:
-            if _compute_type == "CPU":
-                bpy.context.scene.cycles.device = "CPU"
-                _log(f"[GPU_SETUP] Scene device set to CPU")
-            else:
-                bpy.context.scene.cycles.device = "GPU"
-                _log(f"[GPU_SETUP] Scene device set to GPU ({_compute_type})")
-        except Exception as e:
-            _log(f"[GPU_SETUP] Could not set scene device: {e}")
-    except Exception as e:
-        _log(f"[GPU_SETUP] setup_gpu error: {e}")
-
-
-def setup_gpu():
-    """Setup GPU with timeout protection and GPU fallback"""
-    try:
-        run_with_timeout(_setup_gpu_impl, _TIMEOUT_SETUP_GPU, "setup_gpu")
-    except TimeoutError as e:
-        _log(f"[TIMEOUT_ERROR] setup_gpu timed out: {e}")
-        _log(f"[GPU_FALLBACK] Falling back to CPU rendering")
-        global _compute_type
-        _compute_type = "CPU"
-        _record_fallback("has_cpu_fallback", True, "GPU setup timeout")
-    except Exception as e:
-        _log(f"[GPU_SETUP] Unexpected error: {e}")
-        _log(f"[GPU_FALLBACK] Falling back to CPU rendering")
-        _compute_type = "CPU"
-        _record_fallback("has_cpu_fallback", True, f"GPU setup error: {str(e)[:100]}")
-
-
-def _enable_denoiser(scene):
-    scene.cycles.use_denoising = True
-    try:
-        scene.cycles.denoiser = "OPTIX" if _compute_type == "OPTIX" else "OPENIMAGEDENOISE"
-    except Exception:
-        pass
-
-
-# ── Camera helper ─────────────────────────────────────────────
-
-def set_camera_from_matrix(view_matrix_flat):
-    import mathutils
-    cam_data = bpy.data.cameras.get("_remote_cam") or bpy.data.cameras.new("_remote_cam")
-    cam_obj  = bpy.data.objects.get("_remote_cam_obj")
-    if not cam_obj:
-        cam_obj = bpy.data.objects.new("_remote_cam_obj", cam_data)
-        bpy.context.collection.objects.link(cam_obj)
-    bpy.context.scene.camera = cam_obj
-    m = mathutils.Matrix((
-        view_matrix_flat[0:4],
-        view_matrix_flat[4:8],
-        view_matrix_flat[8:12],
-        view_matrix_flat[12:16],
-    ))
-    cam_obj.matrix_world = m.inverted()
-
-
-# ── Render ────────────────────────────────────────────────────
-
-def _render_frame_impl(scene, output_path):
-    """Internal render implementation (to be wrapped with timeout)"""
-    bpy.ops.render.render(write_still=True)
-    return os.path.isfile(output_path)
-
-
-def render_frame(width, height, samples=1, quality=75):
-    global _rendering
-
-    # Validate and clamp render parameters
-    width, height, samples, quality, validation_msg = validate_render_params(width, height, samples, quality)
-    if validation_msg != "OK":
-        _log(f"[VALIDATION] {validation_msg}")
-
-    output_dir  = None
-    output_path = None
-    start       = time.time()
-    # ATOMIC: Set _rendering under lock
-    with _state_lock:
-        _rendering = True
-    try:
-        output_dir  = tempfile.mkdtemp(prefix="wrkr_")
-        output_path = os.path.join(output_dir, "frame.jpg")
-
-        # Render with quality fallback: try full samples, then degrade on timeout
-        samples_attempts = [samples, max(1, samples // 2), max(1, samples // 4), 1]
-        last_error = None
-
-        for attempt, current_samples in enumerate(samples_attempts):
-            try:
-                scene = bpy.context.scene
-                scene.render.resolution_x         = width
-                scene.render.resolution_y         = height
-                scene.render.resolution_percentage = 100
-                scene.cycles.samples               = current_samples
-                _enable_denoiser(scene)
-                scene.render.image_settings.file_format = "JPEG"
-                scene.render.image_settings.quality     = quality
-                scene.render.filepath = output_path
-
-                # Run render with timeout protection
-                render_ok = run_with_timeout(
-                    lambda: _render_frame_impl(scene, output_path),
-                    _TIMEOUT_RENDER,
-                    f"render_frame({width}x{height}@{current_samples}spp)"
-                )
-
-                if render_ok:
-                    with open(output_path, "rb") as f:
-                        jpg_data = f.read()
-                    elapsed_ms = int((time.time() - start) * 1000)
-                    result_b64 = base64.b64encode(jpg_data).decode("ascii")
-                    denoiser = getattr(scene.cycles, "denoiser", "?")
-
-                    # Log if we had to degrade samples
-                    if current_samples < samples:
-                        _log(f"[FALLBACK] Render succeeded with degraded samples: {current_samples}/{samples}")
-                        _record_fallback("samples_degraded", True, f"Fallback to {current_samples} samples")
-
-                    _log(f"{width}x{height} @{current_samples}spp+{denoiser} {elapsed_ms}ms {len(jpg_data)//1024}KB")
-                    _record_metric("render", success=True)
-                    return result_b64
-
-                _log(f"[FALLBACK] Attempt {attempt + 1}: Render produced no output, retrying with fewer samples")
-                last_error = "No output produced"
-
-            except TimeoutError as e:
-                if attempt < len(samples_attempts) - 1:
-                    next_samples = samples_attempts[attempt + 1]
-                    _log(f"[FALLBACK] Render timed out at {current_samples} samples, retrying with {next_samples} samples")
-                    _record_fallback("samples_degraded", True, f"Timeout at {current_samples} samples, fallback to {next_samples}")
-                    last_error = str(e)
-                else:
-                    _log(f"[FALLBACK_EXHAUSTED] Render timeout even at 1 sample: {e}")
-                    last_error = f"Timeout: {str(e)[:100]}"
-
-            except Exception as e:
-                if attempt < len(samples_attempts) - 1:
-                    next_samples = samples_attempts[attempt + 1]
-                    _log(f"[FALLBACK] Render error at {current_samples} samples, retrying with {next_samples}: {e}")
-                    last_error = str(e)
-                else:
-                    _log(f"[FALLBACK_EXHAUSTED] Render error even at 1 sample: {e}")
-                    last_error = f"{type(e).__name__}: {str(e)[:100]}"
-
-        # All fallback attempts exhausted
-        _log(f"[FALLBACK] All render attempts exhausted, last error: {last_error}", "ERROR")
-        _record_metric("render", success=False, error_msg=last_error)
-        return ""
-
-    finally:
-        # ATOMIC: Clear _rendering under lock
-        with _state_lock:
-            _rendering = False
-        # Guaranteed cleanup of temp directory
-        if output_dir and os.path.exists(output_dir):
-            try:
-                shutil.rmtree(output_dir)
-            except Exception as cleanup_err:
-                _log(f"Could not clean {output_dir}: {cleanup_err}")
-
-
-# ── HTTP handler (daemon thread — NO bpy.ops here) ───────────
-
-class WorkerHandler(BaseHTTPRequestHandler):
-    def do_POST(self):
-        global _pending_path   # CRITICAL — without this, assignment is local-only
-
-        try:
-            length   = int(self.headers.get("Content-Length", 0))
-            body     = self.rfile.read(length)
-            data     = json.loads(body.decode("utf-8"))
-            msg_type = data.get("type", "")
-            response = {}
-
-            if msg_type == "ping":
-                # Read all state atomically under _state_lock
-                with _state_lock:
-                    loaded = _scene_loaded
-                    loading = _scene_loading
-                    rendering = _rendering
-                    compute = _compute_type
-
-                # Get fallback state
-                fallback_state = _get_fallback_state()
-
-                response = {
-                    "type":          "pong",
-                    "worker":        True,
-                    "build":         "b36",
-                    "scene_loaded":  loaded,
-                    "scene_loading": loading,
-                    "rendering":     rendering,
-                    "compute":       compute,
-                    "fallback_state": {
-                        "has_cpu_fallback": fallback_state["has_cpu_fallback"],
-                        "samples_degraded": fallback_state["samples_degraded"],
-                        "worker_corrupted": fallback_state["worker_corrupted"],
-                    },
-                }
-                # Detailed logging for scene load polling (helps server diagnose hangs)
-                if loading or loaded:
-                    _log(f"[PING] scene_loading={loading}, scene_loaded={loaded}, rendering={rendering}, "
-                         f"fallback=[CPU={fallback_state['has_cpu_fallback']}, samples_degraded={fallback_state['samples_degraded']}]")
-
-            elif msg_type == "load_scene_path":
-                blend_path = data.get("path", "")
-                _debug(f"[HTTP] load_scene_path request: {blend_path}")
-
-                # Validate path
-                is_valid, validation_msg = validate_path(blend_path)
-                if not is_valid:
-                    _log(f"[VALIDATION_ERROR] load_scene_path: {validation_msg}")
-                    response = {"type": "error", "message": f"Invalid path: {validation_msg}"}
-                else:
-                    _debug(f"[HTTP] File validated, acquiring lock...")
-                    with _pending_lock:
-                        _debug(f"[HTTP] Lock acquired, setting _pending_path")
-                        _pending_path = blend_path
-                    _debug(f"[HTTP] Lock released, pending_path is now set")
-                    _log(f"[HTTP] Queued scene load: {blend_path}")
-                    response = {"type": "scene_loading"}
-
-            elif msg_type == "load_scene":
-                # Legacy: base64 in body
-                blend_b64 = data.get("blend_data", "")
-                if not blend_b64:
-                    response = {"type": "error", "message": "No blend_data"}
-                else:
-                    tmp_file = None
-                    try:
-                        # Validate base64 is properly formatted
-                        try:
-                            blend_data = base64.b64decode(blend_b64, validate=True)
-                        except Exception as e:
-                            _log(f"[VALIDATION_ERROR] Invalid base64 data: {e}")
-                            response = {"type": "error", "message": f"Invalid base64 encoding: {str(e)[:100]}"}
-                            blend_data = None
-
-                        if blend_data is not None:
-                            tmp_file = tempfile.NamedTemporaryFile(suffix=".blend", delete=False)
-                            tmp_file.write(blend_data)
-                            tmp_file.close()
-                            with _pending_lock:
-                                _pending_path = tmp_file.name
-                            _log(f"Queued scene load (from b64): {tmp_file.name}")
-                            response = {"type": "scene_loading"}
-                    except Exception as e:
-                        _log(f"Error writing temp scene file: {e}")
-                        response = {"type": "error", "message": "Failed to load scene data"}
-                    finally:
-                        # Cleanup temp file if exception occurs before _pending_path is set
-                        if tmp_file and tmp_file.name:
-                            if tmp_file not in [_pending_path] and os.path.exists(tmp_file.name):
-                                try:
-                                    os.remove(tmp_file.name)
-                                except Exception as cleanup_err:
-                                    _log(f"Could not clean {tmp_file.name}: {cleanup_err}")
-
-            elif msg_type == "update_camera":
-                view_matrix = data.get("view_matrix")
-                # ATOMIC: Check scene_loaded under lock
-                with _state_lock:
-                    scene_loaded = _scene_loaded
-                if not scene_loaded:
-                    response = {"type": "error", "message": "No scene loaded"}
-                elif view_matrix:
-                    flat = ([x for row in view_matrix for x in row]
-                            if isinstance(view_matrix[0], list) else view_matrix)
-                    with _render_lock:
-                        set_camera_from_matrix(flat)
-                    response = {"type": "camera_updated"}
-                else:
-                    response = {"type": "error", "message": "No view_matrix"}
-
-            elif msg_type == "render_frame":
-                # ATOMIC: Check scene_loaded under lock
-                with _state_lock:
-                    scene_loaded = _scene_loaded
-                    compute = _compute_type
-                if not scene_loaded:
-                    response = {"type": "error", "message": "No scene loaded"}
-                else:
-                    width       = data.get("width", 640)
-                    height      = data.get("height", 360)
-                    samples     = data.get("samples", 1)
-                    quality     = data.get("quality", 75)
-                    view_matrix = data.get("view_matrix")
-
-                    # Validate render parameters
-                    width, height, samples, quality, validation_msg = validate_render_params(width, height, samples, quality)
-                    if validation_msg != "OK":
-                        _log(f"[VALIDATION] render_frame: {validation_msg}")
-
-                    with _render_lock:
-                        if view_matrix:
-                            flat = ([x for row in view_matrix for x in row]
-                                    if isinstance(view_matrix[0], list) else view_matrix)
-                            set_camera_from_matrix(flat)
-                        jpg_b64 = render_frame(width, height, samples, quality)
-                    response = {
-                        "type":    "frame_result",
-                        "jpg_b64": jpg_b64,
-                        "width":   width,
-                        "height":  height,
-                        "samples": samples,
-                        "compute": compute,
-                    }
-
-            elif msg_type == "render_final":
-                # ATOMIC: Check scene_loaded under lock
-                with _state_lock:
-                    scene_loaded = _scene_loaded
-                if not scene_loaded:
-                    response = {"type": "error", "message": "No scene loaded"}
-                else:
-                    width   = data.get("width", 1920)
-                    height  = data.get("height", 1080)
-                    samples = data.get("samples", 128)
-
-                    # Validate render parameters
-                    width, height, samples, quality, validation_msg = validate_render_params(width, height, samples, 100)
-                    if validation_msg != "OK":
-                        _log(f"[VALIDATION] render_final: {validation_msg}")
-                    output_dir = None
-                    try:
-                        with _render_lock:
-                            scene = bpy.context.scene
-                            scene.render.resolution_x         = width
-                            scene.render.resolution_y         = height
-                            scene.render.resolution_percentage = 100
-                            scene.cycles.samples               = samples
-                            _enable_denoiser(scene)
-                            scene.render.image_settings.file_format = "PNG"
-                            output_dir  = tempfile.mkdtemp(prefix="final_")
-                            output_path = os.path.join(output_dir, "final.png")
-                            scene.render.filepath = output_path
-                            start = time.time()
-
-                            # Run final render with timeout protection
-                            try:
-                                render_ok = run_with_timeout(
-                                    lambda: _render_frame_impl(scene, output_path),
-                                    _TIMEOUT_RENDER,
-                                    f"render_final({width}x{height}@{samples}spp)"
-                                )
-                            except TimeoutError as e:
-                                _log(f"[TIMEOUT_ERROR] Final render exceeded {_TIMEOUT_RENDER}s: {e}")
-                                response = {"type": "error", "message": f"Render timeout: {e}"}
-                                render_ok = False
-
-                            if render_ok:
-                                elapsed_ms = int((time.time() - start) * 1000)
-                                if os.path.isfile(output_path):
-                                    with open(output_path, "rb") as f:
-                                        png_data = f.read()
-                                    _log(f"Final {width}x{height}@{samples}spp {elapsed_ms}ms {len(png_data)//1024}KB")
-                                    response = {
-                                        "type":       "render_result",
-                                        "png_b64":    base64.b64encode(png_data).decode("ascii"),
-                                        "width":      width,
-                                        "height":     height,
-                                        "elapsed_ms": elapsed_ms,
-                                    }
-                                else:
-                                    response = {"type": "error", "message": "No output produced"}
-                            else:
-                                response = {"type": "error", "message": "Render failed"}
-                    except TimeoutError as e:
-                        _log(f"[TIMEOUT] Final render timeout: {e}")
-                        response = {"type": "error", "message": f"Render timeout: {e}"}
-                    except Exception as e:
-                        _log(f"Render final error: {e}")
-                        response = {"type": "error", "message": str(e)}
-                    finally:
-                        # Guaranteed cleanup of temp directory
-                        if output_dir and os.path.exists(output_dir):
-                            try:
-                                shutil.rmtree(output_dir)
-                            except Exception as cleanup_err:
-                                _log(f"Could not clean {output_dir}: {cleanup_err}")
-            else:
-                response = {"type": "error", "message": f"Unknown: {msg_type}"}
-
-            resp_bytes = json.dumps(response).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(resp_bytes)))
-            self.end_headers()
-            self.wfile.write(resp_bytes)
-
-        except Exception as e:
-            _log(f"Handler error: {e}")
-            err = json.dumps({"type": "error", "message": str(e)}).encode("utf-8")
-            self.send_response(500)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(err)))
-            self.end_headers()
-            self.wfile.write(err)
-
-    def log_message(self, format, *args):
-        pass
-
-
-# ── Graceful Shutdown ─────────────────────────────────────────
-
-def _cleanup_on_exit():
-    """Cleanup resources on shutdown — called by atexit or KeyboardInterrupt."""
-    _log("[SHUTDOWN] Starting graceful shutdown sequence...", "INFO")
-
-    # Log final metrics summary
-    try:
-        with _metrics_lock:
-            load_success_rate = (_metrics["loads_success"] / _metrics["loads_total"] * 100) if _metrics["loads_total"] > 0 else 0
-            render_success_rate = (_metrics["renders_success"] / _metrics["renders_total"] * 100) if _metrics["renders_total"] > 0 else 0
-            _log(f"[SHUTDOWN_METRICS] Loads: {_metrics['loads_success']}/{_metrics['loads_total']} ({load_success_rate:.1f}%), "
-                 f"Renders: {_metrics['renders_success']}/{_metrics['renders_total']} ({render_success_rate:.1f}%), "
-                 f"Recent errors: {len(_metrics['errors'])}", "INFO")
-    except Exception as e:
-        _log(f"[SHUTDOWN] Error logging metrics: {e}", "WARNING")
-
-    # Clear retry queue to free memory
-    try:
-        with _retry_lock:
-            _log(f"[SHUTDOWN] Clearing retry queue ({len(_load_retry_queue)} items)", "DEBUG")
-            _load_retry_queue.clear()
-    except Exception as e:
-        _log(f"[SHUTDOWN] Error clearing retry queue: {e}", "ERROR")
-
-    # Close any open HTTP server
-    global _http_server
-    if '_http_server' in globals():
-        try:
-            _log("[SHUTDOWN] Closing HTTP server...", "INFO")
-            _http_server.shutdown()
-            _log("[SHUTDOWN] HTTP server closed", "INFO")
-        except Exception as e:
-            _log(f"[SHUTDOWN] HTTP server shutdown error: {e}", "ERROR")
-
-    _log("[SHUTDOWN] Cleanup complete — worker exiting", "INFO")
-
-
-# ── Main ──────────────────────────────────────────────────────
-
-_http_server = None  # Global reference for cleanup
-
 def main():
-    global _pending_path, _scene_loaded, _scene_loading, _http_server
+    """
+    Main entry point: parse job data from environment and execute.
 
-    # Register cleanup handler for graceful shutdown on exit
-    atexit.register(_cleanup_on_exit)
+    Job data source (in priority order):
+    1. RENDER_JOB_JSON environment variable
+    2. Command-line argument after '--'
 
-    setup_gpu()
+    On success: Print JSON result, exit(0)
+    On error: Print JSON error, exit(1)
+    """
 
-    _log("=" * 55, "INFO")
-    _log(f"Blender Render Worker b36 on port {WORKER_PORT}", "INFO")
-    _log(f"Blender {bpy.app.version_string}", "INFO")
-    _log(f"Compute: {_compute_type}", "INFO")
-    _log(f"Log file: {_log_file}", "INFO")
-    _log("=" * 55, "INFO")
-    _debug(f"Starting with extreme debug logging enabled")
+    logger.info(f"Python argv: {sys.argv}")
 
-    _http_server = HTTPServer(("0.0.0.0", WORKER_PORT), WorkerHandler)
-    http_thread = threading.Thread(target=_http_server.serve_forever, daemon=True)
-    http_thread.start()
-    _log(f"HTTP on port {WORKER_PORT} — ready", "INFO")
+    job_json_str = None
 
+    # Priority 1: Environment variable
+    if "RENDER_JOB_JSON" in os.environ:
+        job_json_str = os.environ["RENDER_JOB_JSON"]
+        logger.info("[STARTUP] Job data from RENDER_JOB_JSON environment variable")
+
+    # Priority 2: Command-line argument after '--'
+    elif "--" in sys.argv:
+        try:
+            idx = sys.argv.index("--")
+            if idx + 1 < len(sys.argv):
+                job_json_str = sys.argv[idx + 1]
+                logger.info("[STARTUP] Job data from command-line argument")
+        except Exception as e:
+            logger.warning(f"[STARTUP] Could not parse command-line args: {e}")
+
+    # No job data found
+    if not job_json_str:
+        error_msg = "No job data provided (set RENDER_JOB_JSON env var or pass after --)"
+        logger.error(f"[STARTUP] {error_msg}")
+        print(json.dumps({
+            "status": "error",
+            "error": "NoJobData",
+            "message": error_msg,
+        }))
+        sys.exit(1)
+
+    # ── Parse Job Data ────────────────────────────────────
     try:
-        while True:
-            path_to_load = None
-            retry_info = None
+        job_data = json.loads(job_json_str)
+        logger.info(f"[STARTUP] Job parsed: type={job_data.get('type', '?')}")
+    except json.JSONDecodeError as e:
+        error_msg = f"Invalid JSON in job data: {e}"
+        logger.error(f"[STARTUP] {error_msg}")
+        logger.error(f"[STARTUP] First 200 chars: {job_json_str[:200]}")
+        print(json.dumps({
+            "status": "error",
+            "error": "JSONDecodeError",
+            "message": error_msg,
+        }))
+        sys.exit(1)
 
-            # Priority 1: Check retry queue for paths that need retry
-            with _retry_lock:
-                if _load_retry_queue:
-                    queued_path, attempt, last_retry_time = _load_retry_queue[0]
-                    if _should_retry_now(last_retry_time, attempt):
-                        retry_info = _load_retry_queue.popleft()
-                        path_to_load = queued_path
-                        _log(f"[RETRY_{attempt + 1}/5] Retrying load: {queued_path} (backoff elapsed)")
+    # ── Execute Job ────────────────────────────────────────
+    result = execute_job(job_data)
 
-            # Priority 2: Check for fresh pending path (HTTP handler queued)
-            if not path_to_load:
-                with _pending_lock:
-                    path_to_load = _pending_path
-                    _pending_path = None
+    # Print JSON result to stdout (dispatcher reads this)
+    print(json.dumps(result))
 
-            if path_to_load:
-                is_retry = retry_info is not None
-                attempt_num = retry_info[1] if retry_info else 0
-
-                _log(f"[LOAD_START] Path: {path_to_load}" + (f" [RETRY_{attempt_num + 1}/5]" if is_retry else ""))
-                _debug(f"File exists: {os.path.isfile(path_to_load)}, Size: {os.path.getsize(path_to_load) if os.path.isfile(path_to_load) else 'N/A'} bytes")
-
-                with _state_lock:
-                    # Set state ATOMICALLY: both flags together
-                    _scene_loading = True
-                    _scene_loaded  = False
-                _log(f"[LOAD_STATE] scene_loading=True, scene_loaded=False")
-                _debug(f"Lock acquired, state set")
-
-                load_start_time = time.time()
-                try:
-                    _log(f"[LOAD_MAINFILE_START] Calling open_mainfile")
-                    _debug(f"Context windows available: {len(bpy.context.window_manager.windows)}")
-                    _debug(f"Current window: {bpy.context.window}")
-
-                    # Override context to main window
-                    target_window = bpy.context.window or (bpy.context.window_manager.windows[0] if bpy.context.window_manager.windows else None)
-                    _debug(f"Target window for override: {target_window}")
-
-                    def _open_mainfile_impl():
-                        with bpy.context.temp_override(window=target_window):
-                            _debug(f"Context override entered, calling open_mainfile...")
-                            bpy.ops.wm.open_mainfile(filepath=path_to_load)
-
-                    try:
-                        open_start = time.time()
-                        run_with_timeout(
-                            _open_mainfile_impl,
-                            _TIMEOUT_LOAD_FILE,
-                            f"open_mainfile({os.path.basename(path_to_load)})"
-                        )
-                        open_elapsed = time.time() - open_start
-                        _log(f"[LOAD_MAINFILE_OK] File opened successfully ({open_elapsed:.2f}s)")
-                    except TimeoutError as e:
-                        _log(f"[TIMEOUT_ERROR] open_mainfile exceeded {_TIMEOUT_LOAD_FILE}s: {e}")
-                        raise
-
-                    _debug(f"Context override exited")
-
-                    _log(f"[LOAD_GPU_SETUP_START] Re-initializing GPU")
-                    gpu_start = time.time()
-                    setup_gpu()
-                    gpu_elapsed = time.time() - gpu_start
-                    _log(f"[LOAD_GPU_SETUP_OK] Compute: {_compute_type} ({gpu_elapsed:.2f}s)")
-
-                    _debug(f"Counting objects...")
-                    obj_count = len(bpy.data.objects)
-                    _debug(f"Object count: {obj_count}")
-                    _log(f"[LOAD_OBJECTS] Loaded {obj_count} objects")
-
-                    # Set scene_loaded ONLY after all steps succeed
-                    with _state_lock:
-                        _scene_loaded = True
-                    load_elapsed = time.time() - load_start_time
-                    _log(f"[LOAD_COMPLETE] Scene ready: {obj_count} objects, compute={_compute_type} (total: {load_elapsed:.2f}s)")
-                    _debug(f"Final lock released")
-
-                    # Record successful load metric
-                    _record_metric("load", success=True)
-
-                except Exception as e:
-                    error_msg = f"{type(e).__name__}: {str(e)[:100]}"
-                    _log(f"[LOAD_ERROR] open_mainfile failed: {error_msg}", "ERROR")
-                    _debug(f"Full traceback:\n{traceback.format_exc()}")
-                    with _state_lock:
-                        _scene_loaded = False
-                    _debug(f"Error state set")
-
-                    # Record failed load metric
-                    _record_metric("load", success=False, error_msg=error_msg)
-
-                    # Push to retry queue if under max attempts
-                    with _retry_lock:
-                        next_attempt = attempt_num + 1
-                        if next_attempt < 5:
-                            _load_retry_queue.append((path_to_load, next_attempt, time.time()))
-                            _log(f"[RETRY_QUEUED] Attempt {next_attempt}/5 scheduled for {_retry_backoff_seconds[next_attempt]:.1f}s")
-                        else:
-                            _log(f"[RETRY_EXHAUSTED] Failed after 5 attempts, giving up: {path_to_load}", "ERROR")
-
-                finally:
-                    with _state_lock:
-                        _scene_loading = False
-                    _log(f"[LOAD_DONE] scene_loading=False")
-                    _debug(f"Finally block completed")
-
-                # Restart HTTP if open_mainfile killed the thread
-                if not http_thread.is_alive():
-                    _log("[HTTP_RESTART] HTTP thread died — restarting")
-                    try:
-                        if _http_server:
-                            _http_server.shutdown()
-                    except Exception:
-                        pass
-                    _http_server = HTTPServer(("0.0.0.0", WORKER_PORT), WorkerHandler)
-                    http_thread = threading.Thread(target=_http_server.serve_forever, daemon=True)
-                    http_thread.start()
-                    _log("[HTTP_RESTART_OK] HTTP restarted")
-
-            # Pump Blender window events (non-blocking)
-            try:
-                for i in range(10):  # Process up to 10 pending events
-                    bpy.ops.wm.redraw_timer_execute()
-                _debug(f"[EVENT_PUMP] Processed 10 events")
-            except Exception as e:
-                _debug(f"[EVENT_PUMP] Error: {e}")
-
-            # Get current state under lock for logging
-            with _state_lock:
-                current_loading = _scene_loading
-                current_loaded = _scene_loaded
-                current_rendering = _rendering
-
-            if current_loading or current_loaded or current_rendering:
-                _debug(f"[LOOP] scene_loading={current_loading}, scene_loaded={current_loaded}, rendering={current_rendering}")
-
-            time.sleep(0.05)  # Reduced sleep for more responsive event pumping
-
-    except KeyboardInterrupt:
-        _log("[SHUTDOWN] Received KeyboardInterrupt (Ctrl+C)")
-        _cleanup_on_exit()
+    # ── Exit ───────────────────────────────────────────────
+    exit_code = 0 if result.get("status") == "success" else 1
+    logger.info(f"[EXIT] Exiting with code {exit_code}")
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
