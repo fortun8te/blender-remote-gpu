@@ -133,9 +133,15 @@ class REMOTEGPU_PT_sidebar(bpy.types.Panel):
         else:
             if conn and conn.error:
                 box.label(text=conn.error, icon="ERROR")
+
+            # Auto-discover is the primary action — just plug in cable and click
             col = box.column(align=True)
-            col.scale_y = 1.3
-            col.operator("remotegpu.connect", text="Connect", icon="PLAY")
+            col.scale_y = 1.5
+            col.operator("remotegpu.auto_discover",
+                         text="Auto-discover (TB4 / LAN)", icon="SNAP_ON")
+            col.separator()
+            col.scale_y = 1.0
+            col.operator("remotegpu.connect", text="Connect manually", icon="PLAY")
             col.operator("remotegpu.test_connection", text="Test", icon="FILE_REFRESH")
 
         # ── Scene ─────────────────────────────────────────────

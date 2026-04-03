@@ -6,8 +6,8 @@ b25: Dual-viewport architecture
   - No more "watching a video" — navigate normally, rendered view updates alongside
 """
 
-__version__ = "1.0.25"
-BUILD = "b25"
+__version__ = "1.0.26"
+BUILD = "b26"
 BUILD_DATE = "2026-04-03"
 
 bl_info = {
@@ -41,6 +41,7 @@ classes = [
     preferences.REMOTEGPU_PT_sidebar,
 
     # Connection operators
+    operators.REMOTEGPU_OT_auto_discover,
     operators.REMOTEGPU_OT_connect,
     operators.REMOTEGPU_OT_disconnect,
     operators.REMOTEGPU_OT_test_connection,

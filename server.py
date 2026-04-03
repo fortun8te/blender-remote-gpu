@@ -28,10 +28,11 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-HTTP_PORT = 9876
+HTTP_PORT   = 9876
 SOCKET_PORT = 9877
 XMLRPC_PORT = 9878
 WORKER_PORT = 9880
+BEACON_PORT = 9875   # UDP — Mac listens here for auto-discover
 
 # ── GPU Detection ─────────────────────────────────────────────
 
@@ -425,6 +426,29 @@ def run_xmlrpc():
 
 # ── Main ──────────────────────────────────────────────────────
 
+def run_beacon():
+    """UDP beacon — broadcasts server presence every 2s so Mac can auto-discover.
+    Works over Thunderbolt 4 direct cable (169.254.x.x link-local) and LAN.
+    """
+    import socket as _socket
+    sock = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+    sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_BROADCAST, 1)
+    sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+    msg = json.dumps({
+        "type": "remote_gpu_beacon",
+        "port": HTTP_PORT,
+        "gpu":  GPU_NAME,
+        "build": "b26",
+    }).encode("utf-8")
+    log.info(f"UDP beacon broadcasting on port {BEACON_PORT}")
+    while True:
+        try:
+            sock.sendto(msg, ("255.255.255.255", BEACON_PORT))
+        except Exception:
+            pass
+        time.sleep(2)
+
+
 def main():
     detect_gpu()
     blender = find_blender()
@@ -437,8 +461,8 @@ def main():
     log.info(f"  Worker:  :{WORKER_PORT} (persistent Blender process)")
     log.info("=" * 55)
 
-    # Start protocol servers
-    for fn in [run_http, run_tcp, run_xmlrpc]:
+    # Start protocol servers + beacon
+    for fn in [run_http, run_tcp, run_xmlrpc, run_beacon]:
         threading.Thread(target=fn, daemon=True).start()
 
     log.info("Protocol servers started")

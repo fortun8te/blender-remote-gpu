@@ -2,7 +2,10 @@
 
 import bpy
 import threading
+import json
 from . import engine
+
+BEACON_PORT = 9875  # Must match server.py
 
 
 def _get_prefs(context):
@@ -16,6 +19,67 @@ def _get_prefs(context):
     if addon:
         return addon.preferences
     return None
+
+
+class REMOTEGPU_OT_auto_discover(bpy.types.Operator):
+    """Listen for the Windows server beacon — plug in TB4 cable and click this."""
+    bl_idname = "remotegpu.auto_discover"
+    bl_label = "Auto-discover"
+    bl_description = "Find the Windows render server automatically (Thunderbolt or LAN)"
+
+    _timer = None
+    _thread = None
+    _result = None   # ("ip", "gpu_name") or None
+
+    def execute(self, context):
+        REMOTEGPU_OT_auto_discover._result = None
+
+        def _listen():
+            import socket
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.bind(("", BEACON_PORT))
+                sock.settimeout(6.0)   # wait up to 6 seconds for a beacon
+                data, addr = sock.recvfrom(1024)
+                msg = json.loads(data.decode("utf-8"))
+                if msg.get("type") == "remote_gpu_beacon":
+                    REMOTEGPU_OT_auto_discover._result = (addr[0], msg.get("gpu", "GPU"))
+            except Exception:
+                pass
+            finally:
+                sock.close()
+
+        REMOTEGPU_OT_auto_discover._thread = threading.Thread(target=_listen, daemon=True)
+        REMOTEGPU_OT_auto_discover._thread.start()
+
+        self.report({"INFO"}, "Searching... (make sure server.py is running on Windows)")
+        self._timer = context.window_manager.event_timer_add(0.2, window=context.window)
+        context.window_manager.modal_handler_add(self)
+        return {"RUNNING_MODAL"}
+
+    def modal(self, context, event):
+        if event.type != "TIMER":
+            return {"PASS_THROUGH"}
+        if REMOTEGPU_OT_auto_discover._thread and REMOTEGPU_OT_auto_discover._thread.is_alive():
+            return {"PASS_THROUGH"}
+
+        context.window_manager.event_timer_remove(self._timer)
+        result = REMOTEGPU_OT_auto_discover._result
+
+        if result:
+            ip, gpu = result
+            prefs = _get_prefs(context)
+            if prefs:
+                prefs.server_ip = ip
+            self.report({"INFO"}, f"Found: {gpu} at {ip} — click Connect")
+        else:
+            self.report({"WARNING"},
+                "Nothing found — is server.py running on Windows? TB4 cable plugged in?")
+
+        for area in context.screen.areas:
+            area.tag_redraw()
+        return {"FINISHED"}
 
 
 class REMOTEGPU_OT_connect(bpy.types.Operator):
