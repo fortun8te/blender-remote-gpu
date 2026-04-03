@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Blender Remote GPU Render Server — Unified HTTP + TCP + XMLRPC
-Zero external dependencies. Handles render jobs via Blender CLI subprocess.
+Blender Remote GPU Render Server v2.1
+HTTP + TCP + XMLRPC, scene caching, viewport rendering.
+Zero external dependencies.
 """
 
 import json
@@ -17,7 +18,6 @@ import time
 import uuid
 import base64
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from datetime import datetime
 from xmlrpc.server import SimpleXMLRPCServer
 
 logging.basicConfig(
@@ -51,19 +51,10 @@ def detect_gpu():
     except Exception as e:
         log.warning(f"GPU detection failed: {e}")
 
-# ── Render Job Manager ────────────────────────────────────────
-
-jobs = {}  # job_id -> job dict
-jobs_lock = threading.Lock()
-
 def find_blender():
-    """Find Blender executable."""
-    # Check PATH first
     blender = shutil.which("blender")
     if blender:
         return blender
-
-    # Platform-specific paths
     candidates = []
     if sys.platform == "win32":
         for ver in ["5.0", "4.4", "4.3", "4.2", "4.1", "4.0"]:
@@ -72,14 +63,31 @@ def find_blender():
         candidates.append("/Applications/Blender.app/Contents/MacOS/Blender")
     else:
         candidates.extend(["/usr/bin/blender", "/snap/bin/blender"])
-
     for path in candidates:
         if os.path.isfile(path):
             return path
-
     return None
 
-def run_render(job_id, blend_path, width, height, samples):
+
+# ── Scene Cache ───────────────────────────────────────────────
+
+scenes = {}       # scene_id -> {"path": str, "uploaded": float}
+scenes_lock = threading.Lock()
+SCENE_DIR = os.path.join(tempfile.gettempdir(), "blender_remote_scenes")
+os.makedirs(SCENE_DIR, exist_ok=True)
+
+
+# ── Render Jobs ───────────────────────────────────────────────
+
+jobs = {}
+jobs_lock = threading.Lock()
+
+# Viewport state: latest rendered frame per scene
+viewport_frames = {}   # scene_id -> {"png_b64": str, "rendering": bool}
+viewport_lock = threading.Lock()
+
+
+def run_render(job_id, blend_path, width, height, samples, output_format="PNG"):
     """Render a .blend file using Blender CLI subprocess."""
     blender = find_blender()
     if not blender:
@@ -94,7 +102,9 @@ def run_render(job_id, blend_path, width, height, samples):
     output_dir = tempfile.mkdtemp(prefix="render_")
     output_path = os.path.join(output_dir, "frame0001.png")
 
-    # Python expression to configure render settings
+    # Escape backslashes for Windows paths in Python expression
+    out_escaped = output_dir.replace("\\", "/")
+
     py_expr = (
         f"import bpy; "
         f"s = bpy.context.scene; "
@@ -103,37 +113,30 @@ def run_render(job_id, blend_path, width, height, samples):
         f"s.render.resolution_percentage = 100; "
         f"s.cycles.samples = {samples}; "
         f"s.cycles.device = 'GPU'; "
-        f"s.render.filepath = '{output_dir}/frame'"
+        f"s.render.filepath = '{out_escaped}/frame'"
     )
 
-    cmd = [
-        blender, "-b", blend_path,
-        "--python-expr", py_expr,
-        "-F", "PNG", "-x", "1", "-f", "1"
-    ]
+    cmd = [blender, "-b", blend_path, "--python-expr", py_expr,
+           "-F", output_format, "-x", "1", "-f", "1"]
 
-    log.info(f"Job {job_id}: Starting render {width}x{height} @ {samples} samples")
+    log.info(f"Job {job_id}: Rendering {width}x{height} @ {samples}spp")
 
     try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=600  # 10 min max
-        )
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
 
         if proc.returncode != 0:
-            error_msg = proc.stderr[-500:] if proc.stderr else "Unknown error"
+            err = proc.stderr[-500:] if proc.stderr else "Unknown error"
             with jobs_lock:
                 jobs[job_id]["status"] = "error"
-                jobs[job_id]["error"] = f"Blender exited {proc.returncode}: {error_msg}"
-            log.error(f"Job {job_id}: Render failed (exit {proc.returncode})")
+                jobs[job_id]["error"] = f"Blender exit {proc.returncode}: {err}"
             return
 
         if not os.path.isfile(output_path):
             with jobs_lock:
                 jobs[job_id]["status"] = "error"
-                jobs[job_id]["error"] = "Render completed but output file not found"
+                jobs[job_id]["error"] = "Output file not found"
             return
 
-        # Read PNG and encode as base64
         with open(output_path, "rb") as f:
             png_data = f.read()
 
@@ -147,75 +150,164 @@ def run_render(job_id, blend_path, width, height, samples):
     except subprocess.TimeoutExpired:
         with jobs_lock:
             jobs[job_id]["status"] = "error"
-            jobs[job_id]["error"] = "Render timed out (10 min limit)"
+            jobs[job_id]["error"] = "Render timed out"
     except Exception as e:
         with jobs_lock:
             jobs[job_id]["status"] = "error"
             jobs[job_id]["error"] = str(e)
     finally:
-        # Cleanup
-        try:
-            shutil.rmtree(output_dir, ignore_errors=True)
-            if os.path.isfile(blend_path):
-                os.remove(blend_path)
-        except Exception:
-            pass
+        shutil.rmtree(output_dir, ignore_errors=True)
+
+
+def run_viewport_render(scene_id, width, height, view_matrix, proj_matrix):
+    """Quick low-sample render for viewport preview."""
+    with scenes_lock:
+        scene = scenes.get(scene_id)
+    if not scene:
+        return
+
+    blend_path = scene["path"]
+    blender = find_blender()
+    if not blender:
+        return
+
+    with viewport_lock:
+        viewport_frames[scene_id] = {"png_b64": "", "rendering": True}
+
+    output_dir = tempfile.mkdtemp(prefix="viewport_")
+    output_path = os.path.join(output_dir, "frame0001.png")
+    out_escaped = output_dir.replace("\\", "/")
+
+    # Build camera matrix from view/proj matrices
+    # For viewport: set camera to match the 3D view
+    vm_flat = str([item for row in view_matrix for item in row])
+    pm_flat = str([item for row in proj_matrix for item in row])
+
+    py_expr = (
+        f"import bpy, mathutils; "
+        f"s = bpy.context.scene; "
+        f"s.render.resolution_x = {width}; "
+        f"s.render.resolution_y = {height}; "
+        f"s.render.resolution_percentage = 100; "
+        f"s.cycles.samples = 16; "  # Low samples for fast preview
+        f"s.cycles.device = 'GPU'; "
+        f"s.render.filepath = '{out_escaped}/frame'; "
+        # Create/reuse a viewport camera
+        f"cam = bpy.data.cameras.get('_viewport_cam') or bpy.data.cameras.new('_viewport_cam'); "
+        f"obj = bpy.data.objects.get('_viewport_cam_obj'); "
+        f"exec('\\nif not obj:\\n obj = bpy.data.objects.new(\"_viewport_cam_obj\", cam)\\n bpy.context.collection.objects.link(obj)'); "
+        f"s.camera = obj; "
+        f"vm = {vm_flat}; "
+        f"m = mathutils.Matrix((vm[0:4], vm[4:8], vm[8:12], vm[12:16])); "
+        f"obj.matrix_world = m.inverted()"
+    )
+
+    cmd = [blender, "-b", blend_path, "--python-expr", py_expr,
+           "-F", "PNG", "-x", "1", "-f", "1"]
+
+    log.info(f"Viewport render for scene {scene_id}: {width}x{height} @ 16spp")
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+
+        if proc.returncode == 0 and os.path.isfile(output_path):
+            with open(output_path, "rb") as f:
+                png_data = f.read()
+            with viewport_lock:
+                viewport_frames[scene_id] = {
+                    "png_b64": base64.b64encode(png_data).decode("ascii"),
+                    "rendering": False,
+                }
+            log.info(f"Viewport frame: {len(png_data)} bytes")
+        else:
+            with viewport_lock:
+                viewport_frames[scene_id]["rendering"] = False
+    except Exception as e:
+        log.error(f"Viewport render error: {e}")
+        with viewport_lock:
+            viewport_frames[scene_id]["rendering"] = False
+    finally:
+        shutil.rmtree(output_dir, ignore_errors=True)
 
 
 # ── Message Handler ───────────────────────────────────────────
 
 def handle_message(data):
-    """Process a message and return response."""
     msg_type = data.get("type", "unknown")
 
+    # ── Ping ──
     if msg_type == "ping":
         return {
             "type": "pong",
             "gpu": GPU_NAME,
             "vram_free": GPU_VRAM,
             "timestamp": time.time(),
-            "version": "2.0.0",
-            "build": "b16",
+            "version": "2.1.0",
+            "build": "b22",
         }
 
+    # ── Scene Upload (cache .blend on server) ──
+    elif msg_type == "scene_upload":
+        blend_b64 = data.get("blend_data", "")
+        if not blend_b64:
+            return {"type": "error", "message": "No blend_data"}
+
+        scene_id = str(uuid.uuid4())[:8]
+        blend_data = base64.b64decode(blend_b64)
+        blend_path = os.path.join(SCENE_DIR, f"scene_{scene_id}.blend")
+
+        with open(blend_path, "wb") as f:
+            f.write(blend_data)
+
+        with scenes_lock:
+            scenes[scene_id] = {"path": blend_path, "uploaded": time.time()}
+
+        log.info(f"Scene {scene_id}: Cached ({len(blend_data) // 1024} KB)")
+        return {"type": "scene_cached", "scene_id": scene_id}
+
+    # ── F12 Render Submit ──
     elif msg_type == "render_submit":
-        # Decode blend file from base64
+        # Can use cached scene or inline blend_data
+        scene_id = data.get("scene_id")
         blend_b64 = data.get("blend_data", "")
         width = data.get("width", 1920)
         height = data.get("height", 1080)
         samples = data.get("samples", 128)
 
-        if not blend_b64:
-            return {"type": "error", "message": "No blend_data provided"}
+        # Resolve blend path
+        if scene_id:
+            with scenes_lock:
+                scene = scenes.get(scene_id)
+            if not scene:
+                return {"type": "error", "message": f"Scene {scene_id} not found"}
+            blend_path = scene["path"]
+        elif blend_b64:
+            job_id = str(uuid.uuid4())[:8]
+            blend_data = base64.b64decode(blend_b64)
+            blend_path = os.path.join(tempfile.gettempdir(), f"render_{job_id}.blend")
+            with open(blend_path, "wb") as f:
+                f.write(blend_data)
+        else:
+            return {"type": "error", "message": "No scene_id or blend_data"}
 
-        job_id = str(uuid.uuid4())[:8]
-
-        # Save blend to temp file
-        blend_data = base64.b64decode(blend_b64)
-        blend_path = os.path.join(tempfile.gettempdir(), f"render_{job_id}.blend")
-        with open(blend_path, "wb") as f:
-            f.write(blend_data)
+        job_id = data.get("_job_id", str(uuid.uuid4())[:8])
 
         with jobs_lock:
             jobs[job_id] = {
                 "status": "queued",
                 "submitted": time.time(),
-                "width": width,
-                "height": height,
-                "samples": samples,
+                "width": width, "height": height, "samples": samples,
             }
 
-        # Start render in background
-        thread = threading.Thread(
+        threading.Thread(
             target=run_render,
             args=(job_id, blend_path, width, height, samples),
             daemon=True,
-        )
-        thread.start()
+        ).start()
 
-        log.info(f"Job {job_id}: Queued ({width}x{height} @ {samples}spp)")
         return {"type": "render_queued", "job_id": job_id}
 
+    # ── Job Status ──
     elif msg_type == "job_status":
         job_id = data.get("job_id", "")
         with jobs_lock:
@@ -229,6 +321,7 @@ def handle_message(data):
             "error": job.get("error", ""),
         }
 
+    # ── Job Result ──
     elif msg_type == "job_result":
         job_id = data.get("job_id", "")
         with jobs_lock:
@@ -236,7 +329,7 @@ def handle_message(data):
         if not job:
             return {"type": "error", "message": f"Job {job_id} not found"}
         if job["status"] != "complete":
-            return {"type": "error", "message": f"Job not complete: {job['status']}"}
+            return {"type": "error", "message": f"Not complete: {job['status']}"}
         return {
             "type": "job_result",
             "job_id": job_id,
@@ -244,8 +337,60 @@ def handle_message(data):
             "size": job.get("result_size", 0),
         }
 
+    # ── Viewport Render (uses cached scene, fast low-sample) ──
+    elif msg_type == "viewport_render":
+        scene_id = data.get("scene_id", "")
+        if not scene_id:
+            return {"type": "error", "message": "No scene_id for viewport"}
+
+        width = data.get("width", 640)
+        height = data.get("height", 360)
+        view_matrix = data.get("view_matrix", [])
+        proj_matrix = data.get("proj_matrix", [])
+
+        # Check if already rendering
+        with viewport_lock:
+            frame = viewport_frames.get(scene_id, {})
+            if frame.get("rendering"):
+                # Return last frame if still rendering
+                return {
+                    "type": "viewport_result",
+                    "scene_id": scene_id,
+                    "png_b64": frame.get("png_b64", ""),
+                    "status": "rendering",
+                }
+
+        # Start viewport render in background
+        threading.Thread(
+            target=run_viewport_render,
+            args=(scene_id, width, height, view_matrix, proj_matrix),
+            daemon=True,
+        ).start()
+
+        # Return last available frame immediately
+        with viewport_lock:
+            frame = viewport_frames.get(scene_id, {})
+        return {
+            "type": "viewport_result",
+            "scene_id": scene_id,
+            "png_b64": frame.get("png_b64", ""),
+            "status": "queued",
+        }
+
+    # ── Viewport Poll (get latest frame without starting new render) ──
+    elif msg_type == "viewport_poll":
+        scene_id = data.get("scene_id", "")
+        with viewport_lock:
+            frame = viewport_frames.get(scene_id, {})
+        return {
+            "type": "viewport_result",
+            "scene_id": scene_id,
+            "png_b64": frame.get("png_b64", ""),
+            "status": "rendering" if frame.get("rendering") else "ready",
+        }
+
     else:
-        return {"type": "error", "message": f"Unknown message type: {msg_type}"}
+        return {"type": "error", "message": f"Unknown: {msg_type}"}
 
 
 # ── HTTP Server ───────────────────────────────────────────────
@@ -256,7 +401,10 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length)
             data = json.loads(body.decode("utf-8"))
-            log.info(f"HTTP {data.get('type')} from {self.client_address[0]}")
+
+            msg_type = data.get("type", "?")
+            if msg_type not in ("viewport_render", "viewport_poll"):
+                log.info(f"HTTP {msg_type} from {self.client_address[0]}")
 
             response = handle_message(data)
             resp_bytes = json.dumps(response).encode("utf-8")
@@ -295,21 +443,16 @@ def handle_tcp_client(conn, addr):
             if not chunk:
                 return
             raw_len += chunk
-
         length = int.from_bytes(raw_len, "big")
-        if length > 50_000_000:
+        if length > 100_000_000:
             return
-
         payload = b""
         while len(payload) < length:
             chunk = conn.recv(min(65536, length - len(payload)))
             if not chunk:
                 return
             payload += chunk
-
         data = json.loads(payload.decode("utf-8"))
-        log.info(f"TCP {data.get('type')} from {addr[0]}")
-
         response = handle_message(data)
         resp_bytes = json.dumps(response).encode("utf-8")
         conn.sendall(len(resp_bytes).to_bytes(4, "big"))
@@ -334,11 +477,8 @@ def run_tcp():
 # ── XML-RPC Server ────────────────────────────────────────────
 
 def xmlrpc_handle(json_str):
-    """Handle a JSON message via XML-RPC."""
     data = json.loads(json_str)
-    log.info(f"XMLRPC {data.get('type')}")
-    response = handle_message(data)
-    return json.dumps(response)
+    return json.dumps(handle_message(data))
 
 
 def run_xmlrpc():
@@ -353,28 +493,23 @@ def run_xmlrpc():
 def main():
     detect_gpu()
 
-    log.info("=" * 50)
-    log.info("Blender Remote GPU Render Server v2.0 (b16)")
-    log.info(f"  HTTP:   http://0.0.0.0:{HTTP_PORT}")
-    log.info(f"  TCP:    tcp://0.0.0.0:{SOCKET_PORT}")
-    log.info(f"  XMLRPC: http://0.0.0.0:{XMLRPC_PORT}")
-    log.info(f"  GPU:    {GPU_NAME} ({GPU_VRAM} MB free)")
-
     blender = find_blender()
-    if blender:
-        log.info(f"  Blender: {blender}")
-    else:
-        log.warning("  Blender: NOT FOUND (rendering disabled)")
 
     log.info("=" * 50)
-    log.info("Server ready. Waiting for connections...")
+    log.info("Blender Remote GPU Render Server v2.1 (b22)")
+    log.info(f"  HTTP:    http://0.0.0.0:{HTTP_PORT}")
+    log.info(f"  TCP:     tcp://0.0.0.0:{SOCKET_PORT}")
+    log.info(f"  XMLRPC:  http://0.0.0.0:{XMLRPC_PORT}")
+    log.info(f"  GPU:     {GPU_NAME} ({GPU_VRAM} MB free)")
+    log.info(f"  Blender: {blender or 'NOT FOUND'}")
+    log.info(f"  Scenes:  {SCENE_DIR}")
+    log.info("=" * 50)
 
-    threads = [
+    for t in [
         threading.Thread(target=run_http, daemon=True),
         threading.Thread(target=run_tcp, daemon=True),
         threading.Thread(target=run_xmlrpc, daemon=True),
-    ]
-    for t in threads:
+    ]:
         t.start()
 
     try:

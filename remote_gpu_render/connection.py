@@ -173,13 +173,39 @@ class Connection:
         self.latency_ms = int((time.time() - start) * 1000)
         return json.loads(result)
 
-    # ── Render helpers ────────────────────────────────────────
+    # ── Scene + Render helpers ────────────────────────────────
+
+    _scene_id = None  # Cached scene ID on server
+
+    def upload_scene(self, blend_data_b64):
+        """Upload .blend to server, get scene_id for reuse."""
+        result = self.send({
+            "type": "scene_upload",
+            "blend_data": blend_data_b64,
+        })
+        if result and result.get("type") == "scene_cached":
+            self._scene_id = result.get("scene_id")
+            return self._scene_id
+        return None
 
     def submit_render(self, blend_data_b64, width, height, samples):
         """Submit a render job, returns job_id."""
         result = self.send({
             "type": "render_submit",
             "blend_data": blend_data_b64,
+            "width": width,
+            "height": height,
+            "samples": samples,
+        })
+        if result and result.get("type") == "render_queued":
+            return result.get("job_id")
+        return None
+
+    def submit_render_cached(self, scene_id, width, height, samples):
+        """Submit render using cached scene (no upload needed)."""
+        result = self.send({
+            "type": "render_submit",
+            "scene_id": scene_id,
             "width": width,
             "height": height,
             "samples": samples,
@@ -200,4 +226,22 @@ class Connection:
         return self.send({
             "type": "job_result",
             "job_id": job_id,
+        })
+
+    def viewport_render(self, scene_id, width, height, view_matrix, proj_matrix):
+        """Request a viewport render frame."""
+        return self.send({
+            "type": "viewport_render",
+            "scene_id": scene_id,
+            "width": width,
+            "height": height,
+            "view_matrix": view_matrix,
+            "proj_matrix": proj_matrix,
+        })
+
+    def viewport_poll(self, scene_id):
+        """Get latest viewport frame without starting new render."""
+        return self.send({
+            "type": "viewport_poll",
+            "scene_id": scene_id,
         })
