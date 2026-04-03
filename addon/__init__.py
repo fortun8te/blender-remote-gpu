@@ -2,8 +2,8 @@
 
 # Version scheme: (major, minor, patch) where patch indicates build
 # b1 = 1.0.1, b2 = 1.0.2, b3 = 1.0.3, b4 = 1.0.4, etc.
-__version__ = "1.0.4"
-BUILD = "b4"
+__version__ = "1.0.5"
+BUILD = "b5"
 BUILD_DATE = "2026-04-03"
 
 bl_info = {
