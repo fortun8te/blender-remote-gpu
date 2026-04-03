@@ -46,7 +46,8 @@ WORKER_PORT = int(os.environ.get("WORKER_PORT", "9880"))
 _scene_loaded   = False
 _scene_loading  = False
 _rendering      = False
-_render_lock    = threading.Lock()
+_state_lock     = threading.Lock()  # Protects: _scene_loaded, _scene_loading, _rendering, _compute_type
+_render_lock    = threading.Lock()  # Legacy: kept for bpy.ops calls (Blender context)
 _compute_type   = "NONE"
 
 # Pending scene path — HTTP thread writes, main loop reads
@@ -150,7 +151,9 @@ def render_frame(width, height, samples=1, quality=75):
     scene.render.filepath = output_path
 
     start     = time.time()
-    _rendering = True
+    # ATOMIC: Set _rendering under lock
+    with _state_lock:
+        _rendering = True
     try:
         bpy.ops.render.render(write_still=True)
         if os.path.isfile(output_path):
@@ -167,7 +170,9 @@ def render_frame(width, height, samples=1, quality=75):
         _log(f"Render error: {e}")
         return ""
     finally:
-        _rendering = False
+        # ATOMIC: Clear _rendering under lock
+        with _state_lock:
+            _rendering = False
         try:
             os.remove(output_path)
             os.rmdir(output_dir)
@@ -189,8 +194,8 @@ class WorkerHandler(BaseHTTPRequestHandler):
             response = {}
 
             if msg_type == "ping":
-                # Read all state atomically
-                with _render_lock:
+                # Read all state atomically under _state_lock
+                with _state_lock:
                     loaded = _scene_loaded
                     loading = _scene_loading
                     rendering = _rendering
@@ -199,7 +204,7 @@ class WorkerHandler(BaseHTTPRequestHandler):
                 response = {
                     "type":          "pong",
                     "worker":        True,
-                    "build":         "b35",
+                    "build":         "b36",
                     "scene_loaded":  loaded,
                     "scene_loading": loading,
                     "rendering":     rendering,
@@ -240,7 +245,10 @@ class WorkerHandler(BaseHTTPRequestHandler):
 
             elif msg_type == "update_camera":
                 view_matrix = data.get("view_matrix")
-                if not _scene_loaded:
+                # ATOMIC: Check scene_loaded under lock
+                with _state_lock:
+                    scene_loaded = _scene_loaded
+                if not scene_loaded:
                     response = {"type": "error", "message": "No scene loaded"}
                 elif view_matrix:
                     flat = ([x for row in view_matrix for x in row]
@@ -252,7 +260,11 @@ class WorkerHandler(BaseHTTPRequestHandler):
                     response = {"type": "error", "message": "No view_matrix"}
 
             elif msg_type == "render_frame":
-                if not _scene_loaded:
+                # ATOMIC: Check scene_loaded under lock
+                with _state_lock:
+                    scene_loaded = _scene_loaded
+                    compute = _compute_type
+                if not scene_loaded:
                     response = {"type": "error", "message": "No scene loaded"}
                 else:
                     width       = data.get("width", 640)
@@ -272,11 +284,14 @@ class WorkerHandler(BaseHTTPRequestHandler):
                         "width":   width,
                         "height":  height,
                         "samples": samples,
-                        "compute": _compute_type,
+                        "compute": compute,
                     }
 
             elif msg_type == "render_final":
-                if not _scene_loaded:
+                # ATOMIC: Check scene_loaded under lock
+                with _state_lock:
+                    scene_loaded = _scene_loaded
+                if not scene_loaded:
                     response = {"type": "error", "message": "No scene loaded"}
                 else:
                     width   = data.get("width", 1920)
@@ -364,7 +379,7 @@ def main():
                 _log(f"[LOAD_START] Path: {path}")
                 _debug(f"File exists: {os.path.isfile(path)}, Size: {os.path.getsize(path) if os.path.isfile(path) else 'N/A'} bytes")
 
-                with _render_lock:
+                with _state_lock:
                     # Set state ATOMICALLY: both flags together
                     _scene_loading = True
                     _scene_loaded  = False
@@ -402,7 +417,7 @@ def main():
                     _log(f"[LOAD_OBJECTS] Loaded {obj_count} objects")
 
                     # Set scene_loaded ONLY after all steps succeed
-                    with _render_lock:
+                    with _state_lock:
                         _scene_loaded = True
                     load_elapsed = time.time() - load_start_time
                     _log(f"[LOAD_COMPLETE] Scene ready: {obj_count} objects, compute={_compute_type} (total: {load_elapsed:.2f}s)")
@@ -411,11 +426,11 @@ def main():
                 except Exception as e:
                     _log(f"[LOAD_ERROR] open_mainfile failed: {type(e).__name__}: {e}")
                     _debug(f"Full traceback:\n{traceback.format_exc()}")
-                    with _render_lock:
+                    with _state_lock:
                         _scene_loaded = False
                     _debug(f"Error state set")
                 finally:
-                    with _render_lock:
+                    with _state_lock:
                         _scene_loading = False
                     _log(f"[LOAD_DONE] scene_loading=False")
                     _debug(f"Finally block completed")
@@ -440,8 +455,8 @@ def main():
             except Exception as e:
                 _debug(f"[EVENT_PUMP] Error: {e}")
 
-            # Get current state without lock for logging
-            with _render_lock:
+            # Get current state under lock for logging
+            with _state_lock:
                 current_loading = _scene_loading
                 current_loaded = _scene_loaded
                 current_rendering = _rendering

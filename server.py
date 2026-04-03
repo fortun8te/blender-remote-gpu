@@ -74,6 +74,7 @@ def find_blender():
 
 worker_process = None
 worker_ready = False
+_worker_lock = threading.Lock()  # Protects: worker_process, worker_ready
 
 def start_worker():
     """Launch persistent Blender process with render_worker.py."""
@@ -98,16 +99,19 @@ def start_worker():
         env["PYTHONPATH"] = user_site + (";" + existing if existing else "")
 
     log.info(f"Starting persistent Blender worker...")
-    worker_process = subprocess.Popen(
-        [blender, "--background", "--python", worker_script],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        env=env,
-    )
+    with _worker_lock:
+        worker_process = subprocess.Popen(
+            [blender, "--background", "--python", worker_script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=env,
+        )
 
     # Stream worker output in background
     def _stream_output():
-        for line in worker_process.stdout:
+        with _worker_lock:
+            proc = worker_process
+        for line in proc.stdout:
             text = line.decode("utf-8", errors="replace").rstrip()
             if text:
                 log.info(f"[Worker] {text}")
@@ -117,7 +121,8 @@ def start_worker():
     for i in range(30):  # 30 second timeout
         time.sleep(1)
         if _ping_worker():
-            worker_ready = True
+            with _worker_lock:
+                worker_ready = True
             log.info(f"Worker ready on port {WORKER_PORT}")
             return True
 
@@ -214,14 +219,17 @@ def handle_message(data):
     msg_type = data.get("type", "unknown")
 
     if msg_type == "ping":
+        # ATOMIC: Read worker_ready under lock
+        with _worker_lock:
+            ready = worker_ready
         return {
             "type": "pong",
             "gpu": GPU_NAME,
             "vram_free": GPU_VRAM,
             "timestamp": time.time(),
             "version": "3.0.0",
-            "build": "b34",
-            "worker_ready": worker_ready,
+            "build": "b36",
+            "worker_ready": ready,
         }
 
     # ── Scene Upload → forward to worker ──
@@ -240,7 +248,10 @@ def handle_message(data):
         size_mb = len(blend_data) / 1_048_576
         log.info(f"Scene saved to {blend_path} ({size_mb:.1f} MB)")
 
-        if worker_ready:
+        # ATOMIC: Check worker_ready under lock
+        with _worker_lock:
+            ready = worker_ready
+        if ready:
             # Send just the file PATH — no large data over the socket
             result = send_to_worker({"type": "load_scene_path", "path": blend_path}, timeout=10)
             if result is None:
@@ -294,7 +305,10 @@ def handle_message(data):
 
     # ── Camera-only update (no render) — b24 addition ──
     elif msg_type == "camera_update":
-        if not worker_ready:
+        # ATOMIC: Check worker_ready under lock
+        with _worker_lock:
+            ready = worker_ready
+        if not ready:
             return {"type": "error", "message": "Worker not ready"}
         return send_to_worker({
             "type": "update_camera",
@@ -303,7 +317,10 @@ def handle_message(data):
 
     # ── Viewport Render → forward to worker (FAST path) ──
     elif msg_type == "viewport_render":
-        if not worker_ready:
+        # ATOMIC: Check worker_ready under lock
+        with _worker_lock:
+            ready = worker_ready
+        if not ready:
             return {"type": "error", "message": "Worker not ready"}
 
         result = send_to_worker({
@@ -333,7 +350,10 @@ def handle_message(data):
         samples = data.get("samples", 128)
 
         # If worker is ready and scene is loaded, use worker for final render too
-        if worker_ready and (scene_id == "worker" or not blend_b64):
+        # ATOMIC: Check worker_ready under lock
+        with _worker_lock:
+            ready = worker_ready
+        if ready and (scene_id == "worker" or not blend_b64):
             result = send_to_worker({
                 "type": "render_final",
                 "width": width,
@@ -533,14 +553,19 @@ def main():
     try:
         while True:
             time.sleep(1)
-            # Check if worker is still alive
-            if worker_process and worker_process.poll() is not None:
+            # Check if worker is still alive (atomic read under lock)
+            with _worker_lock:
+                proc = worker_process
+            if proc and proc.poll() is not None:
                 log.warning("Worker died — restarting...")
                 start_worker()
     except KeyboardInterrupt:
         log.info("Shutting down")
-        if worker_process:
-            worker_process.terminate()
+        # ATOMIC: Get worker_process under lock
+        with _worker_lock:
+            proc = worker_process
+        if proc:
+            proc.terminate()
 
 
 if __name__ == "__main__":
