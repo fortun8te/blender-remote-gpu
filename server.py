@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
 Blender Remote GPU Render Server
-HTTP server for render jobs (no external dependencies)
+Dual-mode: HTTP + raw TCP socket (no external dependencies)
 """
 
 import json
 import logging
+import socket
 import sys
+import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime
 
@@ -18,118 +20,153 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-RENDER_PORT = 9876
+HTTP_PORT = 9876
+SOCKET_PORT = 9877
 
+
+def handle_message(data):
+    """Process a message and return response dict."""
+    msg_type = data.get('type', 'unknown')
+
+    if msg_type == 'ping':
+        return {
+            'type': 'pong',
+            'gpu': 'NVIDIA GeForce RTX 5080',
+            'vram_free': 14865,
+            'timestamp': datetime.now().timestamp(),
+            'version': '1.0.4',
+            'build': 'b4'
+        }
+
+    elif msg_type == 'render_request':
+        job_id = data.get('jobId', 'unknown')
+        logger.info(f"Render job {job_id}: would process .blend file")
+        return {
+            'type': 'render_result',
+            'jobId': job_id,
+            'success': False,
+            'error': 'Server in test mode - not rendering'
+        }
+
+    else:
+        return {'type': 'error', 'message': f'Unknown: {msg_type}'}
+
+
+# ── HTTP Server ──────────────────────────────────────────────
 
 class RenderHandler(BaseHTTPRequestHandler):
-    """HTTP request handler for render server"""
-
     def do_POST(self):
-        """Handle POST requests"""
-        print(f"[Server] Received POST request from {self.client_address[0]}", file=sys.stderr)
-
         try:
-            client_ip = self.client_address[0]
-        except Exception as e:
-            client_ip = 'unknown'
-            print(f"[Server] Error getting client IP: {e}", file=sys.stderr)
-
-        try:
-            # Read request body
             content_length = int(self.headers.get('Content-Length', 0))
-            print(f"[Server] Content-Length: {content_length}", file=sys.stderr)
-
             body = self.rfile.read(content_length)
-            print(f"[Server] Body: {body}", file=sys.stderr)
-
             data = json.loads(body.decode('utf-8'))
-            msg_type = data.get('type', 'unknown')
-            logger.info(f"Received {msg_type} from {client_ip}")
-            print(f"[Server] Parsed message type: {msg_type}", file=sys.stderr)
+            logger.info(f"HTTP {data.get('type')} from {self.client_address[0]}")
 
-            response = None
+            response = handle_message(data)
+            response_bytes = json.dumps(response).encode('utf-8')
 
-            if msg_type == 'ping':
-                response = {
-                    'type': 'pong',
-                    'gpu': 'NVIDIA GeForce RTX 5080',
-                    'vram_free': 14865,
-                    'timestamp': datetime.now().timestamp(),
-                    'version': '1.0.4',
-                    'build': 'b4'
-                }
-
-            elif msg_type == 'render_request':
-                job_id = data.get('jobId', 'unknown')
-                logger.info(f"Render job {job_id}: would process .blend file")
-                response = {
-                    'type': 'render_result',
-                    'jobId': job_id,
-                    'success': False,
-                    'error': 'Server in test mode - not rendering'
-                }
-
-            else:
-                logger.warning(f"Unknown message type: {msg_type}")
-                response = {
-                    'type': 'error',
-                    'message': f'Unknown message type: {msg_type}'
-                }
-
-            print(f"[Server] Sending response: {response}", file=sys.stderr)
-
-            # Send response
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
-            self.send_header('Content-Length', len(json.dumps(response).encode('utf-8')))
+            self.send_header('Content-Length', str(len(response_bytes)))
             self.end_headers()
-            self.wfile.write(json.dumps(response).encode('utf-8'))
-            self.wfile.flush()
-            logger.info(f"Sent response for {msg_type}")
-            print(f"[Server] Response sent successfully", file=sys.stderr)
-
-        except json.JSONDecodeError as e:
-            print(f"[Server] JSON decode error: {e}", file=sys.stderr)
-            logger.error(f"Invalid JSON from {client_ip}: {e}")
-            try:
-                self.send_response(400)
-                self.send_header('Content-Type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps({'error': 'Invalid JSON'}).encode('utf-8'))
-            except Exception as write_err:
-                print(f"[Server] Error writing response: {write_err}", file=sys.stderr)
+            self.wfile.write(response_bytes)
 
         except Exception as e:
-            print(f"[Server] Unexpected error: {type(e).__name__}: {e}", file=sys.stderr)
-            logger.error(f"Error processing request: {e}")
-            try:
-                self.send_response(500)
-                self.send_header('Content-Type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps({'error': str(e)}).encode('utf-8'))
-            except Exception as write_err:
-                print(f"[Server] Error writing error response: {write_err}", file=sys.stderr)
+            logger.error(f"HTTP error: {e}")
+            error_bytes = json.dumps({'error': str(e)}).encode('utf-8')
+            self.send_response(500)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(error_bytes)))
+            self.end_headers()
+            self.wfile.write(error_bytes)
 
     def log_message(self, format, *args):
-        """Suppress default HTTP logging"""
-        pass
+        pass  # Suppress default logging
 
+
+def run_http_server():
+    server = HTTPServer(('0.0.0.0', HTTP_PORT), RenderHandler)
+    logger.info(f"HTTP server on port {HTTP_PORT}")
+    server.serve_forever()
+
+
+# ── Raw TCP Socket Server ────────────────────────────────────
+
+def handle_socket_client(conn, addr):
+    """Handle one TCP client: read length-prefixed JSON, respond, close."""
+    try:
+        # Read 4-byte length prefix
+        length_bytes = b""
+        while len(length_bytes) < 4:
+            chunk = conn.recv(4 - len(length_bytes))
+            if not chunk:
+                return
+            length_bytes += chunk
+
+        length = int.from_bytes(length_bytes, 'big')
+        if length > 10_000_000:  # 10MB max
+            return
+
+        # Read payload
+        payload = b""
+        while len(payload) < length:
+            chunk = conn.recv(min(4096, length - len(payload)))
+            if not chunk:
+                return
+            payload += chunk
+
+        data = json.loads(payload.decode('utf-8'))
+        logger.info(f"TCP {data.get('type')} from {addr[0]}")
+
+        response = handle_message(data)
+        response_bytes = json.dumps(response).encode('utf-8')
+
+        # Send response: 4-byte length + JSON
+        conn.sendall(len(response_bytes).to_bytes(4, 'big'))
+        conn.sendall(response_bytes)
+
+    except Exception as e:
+        logger.error(f"TCP error from {addr}: {e}")
+    finally:
+        conn.close()
+
+
+def run_socket_server():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(('0.0.0.0', SOCKET_PORT))
+    sock.listen(5)
+    logger.info(f"TCP socket server on port {SOCKET_PORT}")
+
+    while True:
+        conn, addr = sock.accept()
+        threading.Thread(
+            target=handle_socket_client,
+            args=(conn, addr),
+            daemon=True
+        ).start()
+
+
+# ── Main ─────────────────────────────────────────────────────
 
 def main():
-    """Start HTTP server"""
-    logger.info(f"Starting Blender Render Server on port {RENDER_PORT}")
+    logger.info("Starting Blender Render Server")
+    logger.info(f"  HTTP:   http://0.0.0.0:{HTTP_PORT}")
+    logger.info(f"  Socket: tcp://0.0.0.0:{SOCKET_PORT}")
+    logger.info("✓ Server ready")
 
-    server = HTTPServer(('0.0.0.0', RENDER_PORT), RenderHandler)
-    logger.info(f"Server listening on 0.0.0.0:{RENDER_PORT}")
-    logger.info(f"✓ Server ready, listening on port {RENDER_PORT}")
-    logger.info("Waiting for render jobs...")
+    # Start both servers in threads
+    http_thread = threading.Thread(target=run_http_server, daemon=True)
+    socket_thread = threading.Thread(target=run_socket_server, daemon=True)
 
+    http_thread.start()
+    socket_thread.start()
+
+    # Keep main thread alive
     try:
-        server.serve_forever()
+        while True:
+            threading.Event().wait(1)
     except KeyboardInterrupt:
-        logger.info("Server interrupted")
-    finally:
-        server.server_close()
         logger.info("Server stopped")
 
 
