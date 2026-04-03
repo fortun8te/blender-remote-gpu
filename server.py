@@ -215,7 +215,7 @@ def handle_message(data):
             "vram_free": GPU_VRAM,
             "timestamp": time.time(),
             "version": "3.0.0",
-            "build": "b24",
+            "build": "b34",
             "worker_ready": worker_ready,
         }
 
@@ -243,12 +243,19 @@ def handle_message(data):
 
             if result.get("type") in ("scene_loading", "scene_loaded"):
                 log.info("Scene queued on worker — polling until loaded...")
+                was_loading = False
                 for attempt in range(240):   # up to 120 seconds
                     time.sleep(0.5)
                     ping = send_to_worker({"type": "ping"}, timeout=5)
                     if ping and ping.get("scene_loaded"):
                         log.info(f"Worker scene ready (took ~{attempt * 0.5:.1f}s)")
                         return {"type": "scene_cached", "scene_id": "worker", "objects": 0}
+                    # Detect failed load early: was loading, now stopped but not loaded
+                    if ping and ping.get("scene_loading"):
+                        was_loading = True
+                    elif was_loading and ping and not ping.get("scene_loading") and not ping.get("scene_loaded"):
+                        log.error("Worker load failed (scene_loading went false without scene_loaded)")
+                        return {"type": "error", "message": "Worker failed to load scene — check Blender console"}
                 return {"type": "error", "message": "Worker scene load timed out (120s)"}
 
             return result  # pass through any error
@@ -454,7 +461,7 @@ def run_beacon():
         "type": "remote_gpu_beacon",
         "port": HTTP_PORT,
         "gpu":  GPU_NAME,
-        "build": "b26",
+        "build": "b34",
     }).encode("utf-8")
     log.info(f"UDP beacon broadcasting on port {BEACON_PORT}")
     while True:
@@ -470,7 +477,7 @@ def main():
     blender = find_blender()
 
     log.info("=" * 55)
-    log.info("Blender Remote GPU Render Server v3.0 (b24)")
+    log.info("Blender Remote GPU Render Server v3.0 (b34)")
     log.info(f"  GPU:     {GPU_NAME} ({GPU_VRAM} MB)")
     log.info(f"  Blender: {blender or 'NOT FOUND'}")
     log.info(f"  HTTP:    :{HTTP_PORT}  TCP: :{SOCKET_PORT}  XMLRPC: :{XMLRPC_PORT}")

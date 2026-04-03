@@ -446,10 +446,6 @@ class REMOTEGPU_OT_upload_scene(bpy.types.Operator):
                 blend_b64 = b64.b64encode(f.read()).decode("ascii")
         except Exception as e:
             self.report({'ERROR'}, f"Scene save failed: {e}")
-            try:
-                os.unlink(tmp.name)
-            except Exception:
-                pass
             return {'CANCELLED'}
         finally:
             try:
@@ -584,9 +580,10 @@ class REMOTEGPU_OT_start_live_preview(bpy.types.Operator):
             return {'CANCELLED'}
 
         if _preview_area_ptr is None:
-            self.report({'WARNING'},
-                "No preview viewport set — hover over the right viewport and click "
-                "'Set as Preview Viewport' first")
+            self.report({'ERROR'},
+                "Set a preview viewport first — hover over the right viewport and click "
+                "'Set as Preview Viewport'")
+            return {'CANCELLED'}
 
         start_preview()
         self.report({'INFO'}, "Live preview running — navigate in another viewport")

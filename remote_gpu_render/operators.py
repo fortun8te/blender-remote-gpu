@@ -156,11 +156,26 @@ class REMOTEGPU_OT_disconnect(bpy.types.Operator):
     bl_description = "Disconnect from the render server"
 
     def execute(self, context):
+        # Stop live preview first
+        try:
+            from . import live_preview
+            if live_preview and live_preview.is_active():
+                live_preview.stop_preview()
+        except Exception:
+            pass
+
         conn = engine.RemoteRenderEngine._connection
         if conn:
             conn.close()
             engine.RemoteRenderEngine._connection = None
-            self.report({"INFO"}, "Disconnected")
+
+        # Clear scene state so stale IDs don't persist across reconnects
+        engine.RemoteRenderEngine._scene_id = None
+        engine.RemoteRenderEngine._scene_uploaded = False
+
+        self.report({"INFO"}, "Disconnected")
+        for area in context.screen.areas:
+            area.tag_redraw()
         return {"FINISHED"}
 
 

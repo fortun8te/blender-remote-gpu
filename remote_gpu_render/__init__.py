@@ -32,6 +32,8 @@ if "preferences" in dir():
     importlib.reload(preferences)   # type: ignore[name-defined]
     importlib.reload(engine)        # type: ignore[name-defined]
     importlib.reload(operators)     # type: ignore[name-defined]
+    from . import connection        # type: ignore[no-redef]
+    importlib.reload(connection)    # type: ignore[name-defined]
     if "live_preview" in dir() and live_preview is not None:  # type: ignore[name-defined]
         try:
             importlib.reload(live_preview)  # type: ignore[name-defined]
