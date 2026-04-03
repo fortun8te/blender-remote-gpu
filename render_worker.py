@@ -1,18 +1,32 @@
 #!/usr/bin/env python3
 """
-Persistent Blender Render Worker b35 — runs INSIDE Blender, keeps scene in GPU memory.
+Persistent Blender Render Worker b36 — runs INSIDE Blender, keeps scene in GPU memory.
 
 Launch: blender --background --python render_worker.py
 
-b35: Fix scene load blocking + improve state management:
-  - Atomic state reads in ping (prevents race conditions)
-  - Detailed load logging ([LOAD_*] prefixes for diagnosing hangs)
-  - Blender window event pumping (unblocks bpy.ops.wm.open_mainfile)
-  - Reduced sleep interval for responsive state updates
+b36: EXTREME DEBUG LOGGING - diagnose every step:
+  - Elapsed time tracking for all operations
+  - Per-thread logging with thread names
+  - Memory/thread count tracking
+  - File size and existence checks
+  - Context window debugging
+  - Full exception stack traces
+  - Lock acquisition/release tracking
+  - Event pump status logging
+  - Per-operation timing (open_mainfile, setup_gpu, etc)
+  - HTTP handler detailed logs
+  - Loop state tracking
 """
 
 import sys
 import os
+import traceback
+
+# Try to import psutil for memory tracking (optional)
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 # Add user site-packages to path (workaround for Blender's isolated Python)
 user_site = os.path.expanduser(r"~\AppData\Roaming\Python\Python311\site-packages")
@@ -39,9 +53,27 @@ _compute_type   = "NONE"
 _pending_path = None
 _pending_lock = threading.Lock()
 
+_start_time = time.time()
+
+def _elapsed():
+    return f"{time.time() - _start_time:.3f}s"
 
 def _log(msg):
-    print(f"[Worker] {msg}", flush=True)
+    elapsed = _elapsed()
+    tid = threading.current_thread().name
+    print(f"[{elapsed}] [Worker] [{tid}] {msg}", flush=True)
+
+def _debug(msg):
+    """Extra verbose debug logging"""
+    try:
+        if psutil:
+            proc = psutil.Process()
+            mem = proc.memory_info().rss / 1024 / 1024  # MB
+            _log(f"[DEBUG] {msg} | MEM={mem:.1f}MB | Threads={threading.active_count()}")
+        else:
+            _log(f"[DEBUG] {msg} | Threads={threading.active_count()}")
+    except:
+        _log(f"[DEBUG] {msg}")
 
 
 # ── GPU setup ─────────────────────────────────────────────────
@@ -179,12 +211,17 @@ class WorkerHandler(BaseHTTPRequestHandler):
 
             elif msg_type == "load_scene_path":
                 blend_path = data.get("path", "")
+                _debug(f"[HTTP] load_scene_path request: {blend_path}")
                 if not blend_path or not os.path.isfile(blend_path):
+                    _debug(f"[HTTP] File check failed - exists: {os.path.isfile(blend_path) if blend_path else False}")
                     response = {"type": "error", "message": f"File not found: {blend_path}"}
                 else:
+                    _debug(f"[HTTP] File validated, acquiring lock...")
                     with _pending_lock:
+                        _debug(f"[HTTP] Lock acquired, setting _pending_path")
                         _pending_path = blend_path
-                    _log(f"Queued scene load: {blend_path}")
+                    _debug(f"[HTTP] Lock released, pending_path is now set")
+                    _log(f"[HTTP] Queued scene load: {blend_path}")
                     response = {"type": "scene_loading"}
 
             elif msg_type == "load_scene":
@@ -305,10 +342,11 @@ def main():
     setup_gpu()
 
     _log("=" * 55)
-    _log(f"Blender Render Worker b35 on port {WORKER_PORT}")
+    _log(f"Blender Render Worker b36 on port {WORKER_PORT}")
     _log(f"Blender {bpy.app.version_string}")
     _log(f"Compute: {_compute_type}")
     _log("=" * 55)
+    _debug(f"Starting with extreme debug logging enabled")
 
     server = HTTPServer(("0.0.0.0", WORKER_PORT), WorkerHandler)
     http_thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -324,39 +362,63 @@ def main():
 
             if path:
                 _log(f"[LOAD_START] Path: {path}")
+                _debug(f"File exists: {os.path.isfile(path)}, Size: {os.path.getsize(path) if os.path.isfile(path) else 'N/A'} bytes")
+
                 with _render_lock:
                     # Set state ATOMICALLY: both flags together
                     _scene_loading = True
                     _scene_loaded  = False
                 _log(f"[LOAD_STATE] scene_loading=True, scene_loaded=False")
+                _debug(f"Lock acquired, state set")
 
+                load_start_time = time.time()
                 try:
                     _log(f"[LOAD_MAINFILE_START] Calling open_mainfile")
+                    _debug(f"Context windows available: {len(bpy.context.window_manager.windows)}")
+                    _debug(f"Current window: {bpy.context.window}")
+
                     # Override context to main window
-                    with bpy.context.temp_override(window=bpy.context.window or bpy.context.window_manager.windows[0] if bpy.context.window_manager.windows else None):
+                    target_window = bpy.context.window or (bpy.context.window_manager.windows[0] if bpy.context.window_manager.windows else None)
+                    _debug(f"Target window for override: {target_window}")
+
+                    with bpy.context.temp_override(window=target_window):
+                        _debug(f"Context override entered, calling open_mainfile...")
+                        open_start = time.time()
                         bpy.ops.wm.open_mainfile(filepath=path)
-                    _log(f"[LOAD_MAINFILE_OK] File opened successfully")
+                        open_elapsed = time.time() - open_start
+                        _log(f"[LOAD_MAINFILE_OK] File opened successfully ({open_elapsed:.2f}s)")
+
+                    _debug(f"Context override exited")
 
                     _log(f"[LOAD_GPU_SETUP_START] Re-initializing GPU")
+                    gpu_start = time.time()
                     setup_gpu()
-                    _log(f"[LOAD_GPU_SETUP_OK] Compute: {_compute_type}")
+                    gpu_elapsed = time.time() - gpu_start
+                    _log(f"[LOAD_GPU_SETUP_OK] Compute: {_compute_type} ({gpu_elapsed:.2f}s)")
 
+                    _debug(f"Counting objects...")
                     obj_count = len(bpy.data.objects)
+                    _debug(f"Object count: {obj_count}")
                     _log(f"[LOAD_OBJECTS] Loaded {obj_count} objects")
 
                     # Set scene_loaded ONLY after all steps succeed
                     with _render_lock:
                         _scene_loaded = True
-                    _log(f"[LOAD_COMPLETE] Scene ready: {obj_count} objects, compute={_compute_type}")
+                    load_elapsed = time.time() - load_start_time
+                    _log(f"[LOAD_COMPLETE] Scene ready: {obj_count} objects, compute={_compute_type} (total: {load_elapsed:.2f}s)")
+                    _debug(f"Final lock released")
 
                 except Exception as e:
                     _log(f"[LOAD_ERROR] open_mainfile failed: {type(e).__name__}: {e}")
+                    _debug(f"Full traceback:\n{traceback.format_exc()}")
                     with _render_lock:
                         _scene_loaded = False
+                    _debug(f"Error state set")
                 finally:
                     with _render_lock:
                         _scene_loading = False
                     _log(f"[LOAD_DONE] scene_loading=False")
+                    _debug(f"Finally block completed")
 
                 # Restart HTTP if open_mainfile killed the thread
                 if not http_thread.is_alive():
@@ -372,10 +434,20 @@ def main():
 
             # Pump Blender window events (non-blocking)
             try:
-                for _ in range(10):  # Process up to 10 pending events
+                for i in range(10):  # Process up to 10 pending events
                     bpy.ops.wm.redraw_timer_execute()
-            except Exception:
-                pass
+                _debug(f"[EVENT_PUMP] Processed 10 events")
+            except Exception as e:
+                _debug(f"[EVENT_PUMP] Error: {e}")
+
+            # Get current state without lock for logging
+            with _render_lock:
+                current_loading = _scene_loading
+                current_loaded = _scene_loaded
+                current_rendering = _rendering
+
+            if current_loading or current_loaded or current_rendering:
+                _debug(f"[LOOP] scene_loading={current_loading}, scene_loaded={current_loaded}, rendering={current_rendering}")
 
             time.sleep(0.05)  # Reduced sleep for more responsive event pumping
 
