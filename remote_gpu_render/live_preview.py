@@ -464,13 +464,30 @@ class REMOTEGPU_OT_upload_scene(bpy.types.Operator):
         # Only the HTTP transfer runs in background
         def _upload(blend_data):
             from . import engine as eng
-            scene_id = conn.upload_scene(blend_data)
-            if scene_id:
-                eng.RemoteRenderEngine._scene_id = scene_id
-                eng.RemoteRenderEngine._scene_uploaded = True
-                REMOTEGPU_OT_upload_scene._result = "ok"
-            else:
-                REMOTEGPU_OT_upload_scene._result = "Upload failed — check server logs"
+            try:
+                result_raw = conn.send({
+                    "type": "scene_upload",
+                    "blend_data": blend_data,
+                }, timeout=300)  # 5 min — large scenes over USB4 need time
+
+                print(f"[RemoteGPU] Upload raw response: {str(result_raw)[:200]}")
+
+                if result_raw is None:
+                    REMOTEGPU_OT_upload_scene._result = "No response — server unreachable or timed out"
+                    return
+
+                if result_raw.get("type") == "scene_cached":
+                    scene_id = result_raw.get("scene_id")
+                    eng.RemoteRenderEngine._scene_id = scene_id
+                    eng.RemoteRenderEngine._scene_uploaded = True
+                    REMOTEGPU_OT_upload_scene._result = "ok"
+                else:
+                    err = result_raw.get("message") or result_raw.get("error") or str(result_raw)
+                    REMOTEGPU_OT_upload_scene._result = f"Server error: {err}"
+
+            except Exception as e:
+                print(f"[RemoteGPU] Upload exception: {e}")
+                REMOTEGPU_OT_upload_scene._result = f"Upload exception: {e}"
 
         REMOTEGPU_OT_upload_scene._thread = threading.Thread(
             target=_upload, args=(blend_b64,), daemon=True
@@ -504,16 +521,47 @@ class REMOTEGPU_OT_set_preview_viewport(bpy.types.Operator):
     """Designate the current 3D viewport as the Remote GPU preview target."""
     bl_idname = "remotegpu.set_preview_viewport"
     bl_label = "Set as Preview Viewport"
-    bl_description = "This viewport will show the Remote GPU rendered result"
+    bl_description = "This viewport will show the Remote GPU rendered result (replaces any previous preview viewport)"
 
     @classmethod
     def poll(cls, context):
         return context.area and context.area.type == 'VIEW_3D'
 
     def execute(self, context):
+        current_ptr = context.area.as_pointer()
+        had_previous = (_preview_area_ptr is not None and _preview_area_ptr != current_ptr)
+
         set_preview_area(context.area)
-        self.report({'INFO'}, "This viewport is now the Remote GPU preview")
-        context.area.tag_redraw()
+
+        if had_previous:
+            self.report({'INFO'}, "Preview viewport moved here (previous one released)")
+        else:
+            self.report({'INFO'}, "This viewport is now the Remote GPU preview")
+
+        # Redraw all 3D viewports so the old one loses its highlight too
+        for window in context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type == 'VIEW_3D':
+                    area.tag_redraw()
+        return {'FINISHED'}
+
+
+class REMOTEGPU_OT_clear_preview_viewport(bpy.types.Operator):
+    """Release the preview viewport designation."""
+    bl_idname = "remotegpu.clear_preview_viewport"
+    bl_label = "Release Preview Viewport"
+    bl_description = "Stop using this viewport as the Remote GPU preview target"
+
+    def execute(self, context):
+        global _preview_area_ptr
+        if _preview_active:
+            stop_preview()
+        _preview_area_ptr = None
+        self.report({'INFO'}, "Preview viewport released")
+        for window in context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type == 'VIEW_3D':
+                    area.tag_redraw()
         return {'FINISHED'}
 
 
@@ -566,6 +614,7 @@ class REMOTEGPU_OT_stop_live_preview(bpy.types.Operator):
 classes = [
     REMOTEGPU_OT_upload_scene,
     REMOTEGPU_OT_set_preview_viewport,
+    REMOTEGPU_OT_clear_preview_viewport,
     REMOTEGPU_OT_start_live_preview,
     REMOTEGPU_OT_stop_live_preview,
 ]

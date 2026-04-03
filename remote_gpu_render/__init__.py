@@ -174,19 +174,29 @@ class REMOTEGPU_PT_sidebar(bpy.types.Panel):
             box.label(text="Check System Console for details")
         else:
             # Preview viewport status
-            if lp._preview_area_ptr is not None:
-                current_area_ptr = context.area.as_pointer() if context.area else None
-                if current_area_ptr == lp._preview_area_ptr:
-                    box.label(text="This is the Preview Viewport", icon="VIEW3D")
-                else:
-                    box.label(text="Preview viewport is set", icon="CHECKMARK")
-            else:
-                box.label(text="No preview viewport set", icon="INFO")
+            current_area_ptr = context.area.as_pointer() if context.area else None
+            is_this_the_preview = (lp._preview_area_ptr is not None and
+                                   current_area_ptr == lp._preview_area_ptr)
+            preview_set_elsewhere = (lp._preview_area_ptr is not None and
+                                     not is_this_the_preview)
 
-            row = box.row()
-            row.operator("remotegpu.set_preview_viewport",
-                         text="Set This as Preview Viewport",
-                         icon="PINNED")
+            if is_this_the_preview:
+                # This IS the preview viewport
+                row = box.row()
+                row.alert = True
+                row.label(text="PREVIEW VIEWPORT", icon="RESTRICT_VIEW_OFF")
+                box.operator("remotegpu.clear_preview_viewport",
+                             text="Release", icon="X")
+            elif preview_set_elsewhere:
+                # A different viewport is the preview
+                box.label(text="Preview active in another viewport", icon="INFO")
+                box.operator("remotegpu.set_preview_viewport",
+                             text="Move Preview Here", icon="PINNED")
+            else:
+                # No preview viewport set yet
+                box.label(text="No preview viewport set", icon="RADIOBUT_OFF")
+                box.operator("remotegpu.set_preview_viewport",
+                             text="Set This as Preview Viewport", icon="PINNED")
 
             row = box.row()
             row.scale_y = 1.5
@@ -240,6 +250,7 @@ def _build_classes():
         cls += [
             live_preview.REMOTEGPU_OT_upload_scene,
             live_preview.REMOTEGPU_OT_set_preview_viewport,
+            live_preview.REMOTEGPU_OT_clear_preview_viewport,
             live_preview.REMOTEGPU_OT_start_live_preview,
             live_preview.REMOTEGPU_OT_stop_live_preview,
         ]
