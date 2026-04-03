@@ -25,6 +25,8 @@ from collections import deque
 import signal
 import platform
 import atexit
+import logging
+from logging.handlers import RotatingFileHandler
 
 # Try to import psutil for memory tracking (optional)
 try:
@@ -45,6 +47,22 @@ import time
 import threading
 import shutil
 from http.server import HTTPServer, BaseHTTPRequestHandler
+
+# ── Structured Logging Setup ───────────────────────────────────
+# File-based logging with rotation (10MB per file, keep 5 files)
+_log_dir = tempfile.gettempdir()
+_log_file = os.path.join(_log_dir, "blender_worker.log")
+_formatter = logging.Formatter('[%(asctime)s] [Worker] [%(levelname)s] %(message)s', datefmt='%H:%M:%S')
+_logger = logging.getLogger('blender_worker')
+_logger.setLevel(logging.DEBUG)
+
+# Rotating file handler
+try:
+    _file_handler = RotatingFileHandler(_log_file, maxBytes=10*1024*1024, backupCount=5)
+    _file_handler.setFormatter(_formatter)
+    _logger.addHandler(_file_handler)
+except Exception as e:
+    print(f"[LOGGING_ERROR] Could not setup file logging: {e}", flush=True)
 
 # Timeout constants (in seconds)
 _TIMEOUT_LOAD_FILE = 60      # Max 60s for open_mainfile
@@ -73,13 +91,32 @@ _retry_backoff_seconds = [0.5, 1.0, 2.0, 4.0, 8.0]  # Exponential backoff per at
 
 _start_time = time.time()
 
+# ── Metrics Tracking (thread-safe) ─────────────────────────────
+_metrics = {
+    "loads_total": 0,
+    "loads_success": 0,
+    "loads_failed": 0,
+    "renders_total": 0,
+    "renders_success": 0,
+    "errors": [],  # Last 20 errors for diagnostics
+}
+_metrics_lock = threading.Lock()
+_last_metrics_log = time.time()
+_metrics_log_interval = 30  # Log metrics every 30 seconds
+
 def _elapsed():
     return f"{time.time() - _start_time:.3f}s"
 
-def _log(msg):
+def _log(msg, level="INFO"):
+    """Structured logging with timestamp, component, level, message."""
     elapsed = _elapsed()
     tid = threading.current_thread().name
-    print(f"[{elapsed}] [Worker] [{tid}] {msg}", flush=True)
+    formatted_msg = f"[{elapsed}] [Worker] [{tid}] {msg}"
+    print(formatted_msg, flush=True)
+    try:
+        _logger.log(getattr(logging, level, logging.INFO), f"[{tid}] {msg}")
+    except Exception:
+        pass
 
 def _debug(msg):
     """Extra verbose debug logging"""
@@ -87,11 +124,39 @@ def _debug(msg):
         if psutil:
             proc = psutil.Process()
             mem = proc.memory_info().rss / 1024 / 1024  # MB
-            _log(f"[DEBUG] {msg} | MEM={mem:.1f}MB | Threads={threading.active_count()}")
+            _log(f"[DEBUG] {msg} | MEM={mem:.1f}MB | Threads={threading.active_count()}", "DEBUG")
         else:
-            _log(f"[DEBUG] {msg} | Threads={threading.active_count()}")
+            _log(f"[DEBUG] {msg} | Threads={threading.active_count()}", "DEBUG")
     except:
-        _log(f"[DEBUG] {msg}")
+        _log(f"[DEBUG] {msg}", "DEBUG")
+
+def _record_metric(metric_name, success=True, error_msg=None):
+    """Record a metric operation (thread-safe)."""
+    global _last_metrics_log
+    with _metrics_lock:
+        if metric_name == "load":
+            _metrics["loads_total"] += 1
+            if success:
+                _metrics["loads_success"] += 1
+            else:
+                _metrics["loads_failed"] += 1
+        elif metric_name == "render":
+            _metrics["renders_total"] += 1
+            if success:
+                _metrics["renders_success"] += 1
+
+        # Track errors (keep last 20)
+        if error_msg:
+            _metrics["errors"].append({"timestamp": time.time(), "error": error_msg})
+            if len(_metrics["errors"]) > 20:
+                _metrics["errors"].pop(0)
+
+        # Log metrics summary every 30 seconds
+        if time.time() - _last_metrics_log >= _metrics_log_interval:
+            _log(f"[METRICS] Loads: {_metrics['loads_success']}/{_metrics['loads_total']} success, "
+                 f"Renders: {_metrics['renders_success']}/{_metrics['renders_total']} success, "
+                 f"Recent errors: {len(_metrics['errors'])}", "INFO")
+            _last_metrics_log = time.time()
 
 
 # ── Timeout Handler ───────────────────────────────────────────
@@ -385,14 +450,18 @@ def render_frame(width, height, samples=1, quality=75):
             result_b64 = base64.b64encode(jpg_data).decode("ascii")
             denoiser = getattr(scene.cycles, "denoiser", "?")
             _log(f"{width}x{height} @{samples}spp+{denoiser} {elapsed_ms}ms {len(jpg_data)//1024}KB")
+            _record_metric("render", success=True)
             return result_b64
-        _log("Render produced no output")
+        _log("Render produced no output", "WARNING")
+        _record_metric("render", success=False, error_msg="No output produced")
         return ""
     except TimeoutError as e:
-        _log(f"[TIMEOUT] Render timeout: {e}")
+        _log(f"[TIMEOUT] Render timeout: {e}", "ERROR")
+        _record_metric("render", success=False, error_msg=f"Timeout: {str(e)[:100]}")
         return ""
     except Exception as e:
-        _log(f"Render error: {e}")
+        _log(f"Render error: {e}", "ERROR")
+        _record_metric("render", success=False, error_msg=f"{type(e).__name__}: {str(e)[:100]}")
         return ""
     finally:
         # ATOMIC: Clear _rendering under lock
@@ -643,27 +712,38 @@ class WorkerHandler(BaseHTTPRequestHandler):
 
 def _cleanup_on_exit():
     """Cleanup resources on shutdown — called by atexit or KeyboardInterrupt."""
-    _log("[SHUTDOWN] Starting graceful shutdown sequence...")
+    _log("[SHUTDOWN] Starting graceful shutdown sequence...", "INFO")
+
+    # Log final metrics summary
+    try:
+        with _metrics_lock:
+            load_success_rate = (_metrics["loads_success"] / _metrics["loads_total"] * 100) if _metrics["loads_total"] > 0 else 0
+            render_success_rate = (_metrics["renders_success"] / _metrics["renders_total"] * 100) if _metrics["renders_total"] > 0 else 0
+            _log(f"[SHUTDOWN_METRICS] Loads: {_metrics['loads_success']}/{_metrics['loads_total']} ({load_success_rate:.1f}%), "
+                 f"Renders: {_metrics['renders_success']}/{_metrics['renders_total']} ({render_success_rate:.1f}%), "
+                 f"Recent errors: {len(_metrics['errors'])}", "INFO")
+    except Exception as e:
+        _log(f"[SHUTDOWN] Error logging metrics: {e}", "WARNING")
 
     # Clear retry queue to free memory
     try:
         with _retry_lock:
-            _log(f"[SHUTDOWN] Clearing retry queue ({len(_load_retry_queue)} items)")
+            _log(f"[SHUTDOWN] Clearing retry queue ({len(_load_retry_queue)} items)", "DEBUG")
             _load_retry_queue.clear()
     except Exception as e:
-        _log(f"[SHUTDOWN] Error clearing retry queue: {e}")
+        _log(f"[SHUTDOWN] Error clearing retry queue: {e}", "ERROR")
 
     # Close any open HTTP server
     global _http_server
     if '_http_server' in globals():
         try:
-            _log("[SHUTDOWN] Closing HTTP server...")
+            _log("[SHUTDOWN] Closing HTTP server...", "INFO")
             _http_server.shutdown()
-            _log("[SHUTDOWN] HTTP server closed")
+            _log("[SHUTDOWN] HTTP server closed", "INFO")
         except Exception as e:
-            _log(f"[SHUTDOWN] HTTP server shutdown error: {e}")
+            _log(f"[SHUTDOWN] HTTP server shutdown error: {e}", "ERROR")
 
-    _log("[SHUTDOWN] Cleanup complete — worker exiting")
+    _log("[SHUTDOWN] Cleanup complete — worker exiting", "INFO")
 
 
 # ── Main ──────────────────────────────────────────────────────
@@ -678,17 +758,18 @@ def main():
 
     setup_gpu()
 
-    _log("=" * 55)
-    _log(f"Blender Render Worker b36 on port {WORKER_PORT}")
-    _log(f"Blender {bpy.app.version_string}")
-    _log(f"Compute: {_compute_type}")
-    _log("=" * 55)
+    _log("=" * 55, "INFO")
+    _log(f"Blender Render Worker b36 on port {WORKER_PORT}", "INFO")
+    _log(f"Blender {bpy.app.version_string}", "INFO")
+    _log(f"Compute: {_compute_type}", "INFO")
+    _log(f"Log file: {_log_file}", "INFO")
+    _log("=" * 55, "INFO")
     _debug(f"Starting with extreme debug logging enabled")
 
     _http_server = HTTPServer(("0.0.0.0", WORKER_PORT), WorkerHandler)
     http_thread = threading.Thread(target=_http_server.serve_forever, daemon=True)
     http_thread.start()
-    _log(f"HTTP on port {WORKER_PORT} — ready")
+    _log(f"HTTP on port {WORKER_PORT} — ready", "INFO")
 
     try:
         while True:
@@ -772,12 +853,19 @@ def main():
                     _log(f"[LOAD_COMPLETE] Scene ready: {obj_count} objects, compute={_compute_type} (total: {load_elapsed:.2f}s)")
                     _debug(f"Final lock released")
 
+                    # Record successful load metric
+                    _record_metric("load", success=True)
+
                 except Exception as e:
-                    _log(f"[LOAD_ERROR] open_mainfile failed: {type(e).__name__}: {e}")
+                    error_msg = f"{type(e).__name__}: {str(e)[:100]}"
+                    _log(f"[LOAD_ERROR] open_mainfile failed: {error_msg}", "ERROR")
                     _debug(f"Full traceback:\n{traceback.format_exc()}")
                     with _state_lock:
                         _scene_loaded = False
                     _debug(f"Error state set")
+
+                    # Record failed load metric
+                    _record_metric("load", success=False, error_msg=error_msg)
 
                     # Push to retry queue if under max attempts
                     with _retry_lock:
@@ -786,7 +874,7 @@ def main():
                             _load_retry_queue.append((path_to_load, next_attempt, time.time()))
                             _log(f"[RETRY_QUEUED] Attempt {next_attempt}/5 scheduled for {_retry_backoff_seconds[next_attempt]:.1f}s")
                         else:
-                            _log(f"[RETRY_EXHAUSTED] Failed after 5 attempts, giving up: {path_to_load}")
+                            _log(f"[RETRY_EXHAUSTED] Failed after 5 attempts, giving up: {path_to_load}", "ERROR")
 
                 finally:
                     with _state_lock:

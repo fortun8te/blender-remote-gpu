@@ -21,13 +21,74 @@ import urllib.request
 import urllib.error
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from xmlrpc.server import SimpleXMLRPCServer
+from logging.handlers import RotatingFileHandler
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] [Server] %(message)s',
-    datefmt='%H:%M:%S'
-)
-log = logging.getLogger(__name__)
+# ── Structured Logging Setup ───────────────────────────────────
+# File-based logging with rotation (10MB per file, keep 5 files)
+_log_dir = tempfile.gettempdir()
+_log_file = os.path.join(_log_dir, "blender_server.log")
+_formatter = logging.Formatter('[%(asctime)s] [Server] [%(levelname)s] %(message)s', datefmt='%H:%M:%S')
+_logger = logging.getLogger('blender_server')
+_logger.setLevel(logging.DEBUG)
+
+# Console handler
+_console_handler = logging.StreamHandler()
+_console_handler.setFormatter(_formatter)
+_logger.addHandler(_console_handler)
+
+# Rotating file handler
+try:
+    _file_handler = RotatingFileHandler(_log_file, maxBytes=10*1024*1024, backupCount=5)
+    _file_handler.setFormatter(_formatter)
+    _logger.addHandler(_file_handler)
+except Exception as e:
+    print(f"[LOGGING_ERROR] Could not setup file logging: {e}", flush=True)
+
+log = _logger  # Use structured logger
+
+# ── Request/Response Metrics (thread-safe) ─────────────────────
+_request_metrics = {
+    "total_requests": 0,
+    "successful_requests": 0,
+    "failed_requests": 0,
+    "error_counts": {},  # Count by error type
+    "last_request_time": None,
+    "avg_response_time_ms": 0,
+    "response_times": [],  # Last 100 response times for rolling average
+}
+_request_metrics_lock = threading.Lock()
+_last_request_log_time = time.time()
+_request_log_interval = 30  # Log request metrics every 30 seconds
+
+def _record_request(msg_type, response_time_ms, success=True, error_type=None):
+    """Record HTTP request metrics (thread-safe)."""
+    global _last_request_log_time
+    with _request_metrics_lock:
+        _request_metrics["total_requests"] += 1
+        _request_metrics["last_request_time"] = time.time()
+
+        if success:
+            _request_metrics["successful_requests"] += 1
+        else:
+            _request_metrics["failed_requests"] += 1
+            if error_type:
+                _request_metrics["error_counts"][error_type] = _request_metrics["error_counts"].get(error_type, 0) + 1
+
+        # Track rolling average of response times (last 100)
+        _request_metrics["response_times"].append(response_time_ms)
+        if len(_request_metrics["response_times"]) > 100:
+            _request_metrics["response_times"].pop(0)
+        if _request_metrics["response_times"]:
+            _request_metrics["avg_response_time_ms"] = sum(_request_metrics["response_times"]) / len(_request_metrics["response_times"])
+
+        # Log request metrics summary every 30 seconds
+        if time.time() - _last_request_log_time >= _request_log_interval:
+            success_rate = (_request_metrics["successful_requests"] / _request_metrics["total_requests"] * 100) if _request_metrics["total_requests"] > 0 else 0
+            error_summary = ", ".join([f"{k}: {v}" for k, v in list(_request_metrics["error_counts"].items())[:3]])
+            log.info(f"[METRICS] Total: {_request_metrics['total_requests']}, Success: {success_rate:.1f}%, "
+                    f"Avg Response: {_request_metrics['avg_response_time_ms']:.0f}ms, "
+                    f"Errors: {error_summary if error_summary else 'none'}")
+            _last_request_log_time = time.time()
 
 
 # ── Input Validation ──────────────────────────────────────────
@@ -556,6 +617,12 @@ def handle_message(data):
 
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
+        request_start_time = time.time()
+        client_ip = self.client_address[0]
+        msg_type = "unknown"
+        response_status = 500
+        is_success = False
+
         try:
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length)
@@ -564,21 +631,49 @@ class Handler(BaseHTTPRequestHandler):
             # Validate JSON message structure
             is_valid, validation_msg = validate_json_message(data)
             if not is_valid:
-                log.error(f"[VALIDATION_ERROR] HTTP: {validation_msg}")
+                log.error(f"[VALIDATION_ERROR] HTTP: {validation_msg} from {client_ip}")
                 response = {"type": "error", "message": f"Invalid message: {validation_msg}"}
+                response_status = 400
+                _record_request("invalid_json", 0, success=False, error_type="validation_error")
             else:
                 msg_type = data.get("type", "?")
-                if msg_type not in ("viewport_render", "viewport_poll"):
-                    log.info(f"HTTP {msg_type} from {self.client_address[0]}")
                 response = handle_message(data)
+
+                # Determine success based on response type
+                response_type = response.get("type", "")
+                is_success = response_type != "error"
+                response_status = 200
+
+                # Log all requests with client IP and message type (except high-frequency ones)
+                response_time_ms = int((time.time() - request_start_time) * 1000)
+                if msg_type not in ("viewport_render", "viewport_poll"):
+                    status = "OK" if is_success else "ERROR"
+                    log.info(f"[HTTP] [{client_ip}] {msg_type} {status} in {response_time_ms}ms")
+
+                _record_request(msg_type, response_time_ms, success=is_success,
+                               error_type=response_type if not is_success else None)
+
             resp_bytes = json.dumps(response).encode("utf-8")
-            self.send_response(200)
+            self.send_response(response_status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(resp_bytes)))
             self.end_headers()
             self.wfile.write(resp_bytes)
+
+        except json.JSONDecodeError as e:
+            response_time_ms = int((time.time() - request_start_time) * 1000)
+            log.error(f"[HTTP] [{client_ip}] JSON decode error: {e} in {response_time_ms}ms")
+            _record_request("json_decode", response_time_ms, success=False, error_type="json_decode_error")
+            err = json.dumps({"error": f"Invalid JSON: {str(e)}"}).encode("utf-8")
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(err)))
+            self.end_headers()
+            self.wfile.write(err)
         except Exception as e:
-            log.error(f"HTTP error: {e}")
+            response_time_ms = int((time.time() - request_start_time) * 1000)
+            log.error(f"[HTTP] [{client_ip}] Exception: {type(e).__name__}: {e} in {response_time_ms}ms")
+            _record_request(msg_type, response_time_ms, success=False, error_type=type(e).__name__)
             err = json.dumps({"error": str(e)}).encode("utf-8")
             self.send_response(500)
             self.send_header("Content-Type", "application/json")
@@ -596,6 +691,11 @@ def run_http():
 # ── TCP Socket Server ─────────────────────────────────────────
 
 def handle_tcp_client(conn, addr):
+    request_start_time = time.time()
+    client_ip = addr[0] if addr else "unknown"
+    msg_type = "unknown"
+    is_success = False
+
     try:
         raw_len = b""
         while len(raw_len) < 4:
@@ -604,8 +704,10 @@ def handle_tcp_client(conn, addr):
             raw_len += chunk
         length = int.from_bytes(raw_len, "big")
         if length > 100_000_000:
-            log.error("[VALIDATION_ERROR] TCP: Message size exceeds 100MB limit")
+            log.error(f"[TCP] [{client_ip}] Message size exceeds 100MB limit")
+            _record_request("tcp_oversized", int((time.time() - request_start_time) * 1000), success=False, error_type="oversized_message")
             return
+
         payload = b""
         while len(payload) < length:
             chunk = conn.recv(min(65536, length - len(payload)))
@@ -616,15 +718,28 @@ def handle_tcp_client(conn, addr):
         # Validate JSON message structure
         is_valid, validation_msg = validate_json_message(data)
         if not is_valid:
-            log.error(f"[VALIDATION_ERROR] TCP: {validation_msg}")
+            log.error(f"[TCP] [{client_ip}] Validation error: {validation_msg}")
             response = {"type": "error", "message": f"Invalid message: {validation_msg}"}
+            _record_request("tcp_validation", int((time.time() - request_start_time) * 1000), success=False, error_type="validation_error")
         else:
+            msg_type = data.get("type", "?")
             response = handle_message(data)
+            is_success = response.get("type") != "error"
+            response_time_ms = int((time.time() - request_start_time) * 1000)
+            _record_request(msg_type, response_time_ms, success=is_success, error_type=response.get("type") if not is_success else None)
+            log.info(f"[TCP] [{client_ip}] {msg_type} {'OK' if is_success else 'ERROR'} in {response_time_ms}ms")
+
         resp_bytes = json.dumps(response).encode("utf-8")
         conn.sendall(len(resp_bytes).to_bytes(4, "big"))
         conn.sendall(resp_bytes)
+    except json.JSONDecodeError as e:
+        response_time_ms = int((time.time() - request_start_time) * 1000)
+        log.error(f"[TCP] [{client_ip}] JSON decode error: {e} in {response_time_ms}ms")
+        _record_request("tcp_json_decode", response_time_ms, success=False, error_type="json_decode_error")
     except Exception as e:
-        log.error(f"TCP error: {e}")
+        response_time_ms = int((time.time() - request_start_time) * 1000)
+        log.error(f"[TCP] [{client_ip}] Exception: {type(e).__name__}: {e} in {response_time_ms}ms")
+        _record_request(msg_type, response_time_ms, success=False, error_type=type(e).__name__)
     finally:
         conn.close()
 
@@ -686,6 +801,19 @@ def shutdown_worker():
 def shutdown_handler(signum, frame):
     """Signal handler for graceful shutdown."""
     log.info("[SHUTDOWN] Received SIGINT (Ctrl+C)")
+
+    # Log final metrics summary
+    try:
+        with _request_metrics_lock:
+            success_rate = (_request_metrics["successful_requests"] / _request_metrics["total_requests"] * 100) if _request_metrics["total_requests"] > 0 else 0
+            error_summary = ", ".join([f"{k}: {v}" for k, v in list(_request_metrics["error_counts"].items())[:5]])
+            log.info(f"[SHUTDOWN_METRICS] Total requests: {_request_metrics['total_requests']}, "
+                    f"Success rate: {success_rate:.1f}%, "
+                    f"Avg response: {_request_metrics['avg_response_time_ms']:.0f}ms, "
+                    f"Top errors: {error_summary if error_summary else 'none'}")
+    except Exception as e:
+        log.warning(f"[SHUTDOWN] Error logging final metrics: {e}")
+
     shutdown_worker()
     log.info("[SHUTDOWN] Shutdown complete, exiting...")
     sys.exit(0)
@@ -724,11 +852,12 @@ def main():
     blender = find_blender()
 
     log.info("=" * 55)
-    log.info("Blender Remote GPU Render Server v3.0 (b34)")
+    log.info("Blender Remote GPU Render Server v3.0 (b36)")
     log.info(f"  GPU:     {GPU_NAME} ({GPU_VRAM} MB)")
     log.info(f"  Blender: {blender or 'NOT FOUND'}")
     log.info(f"  HTTP:    :{HTTP_PORT}  TCP: :{SOCKET_PORT}  XMLRPC: :{XMLRPC_PORT}")
     log.info(f"  Worker:  :{WORKER_PORT} (persistent Blender process)")
+    log.info(f"  Log file: {_log_file}")
     log.info("=" * 55)
 
     # Start protocol servers + beacon
