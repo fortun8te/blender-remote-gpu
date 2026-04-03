@@ -74,7 +74,8 @@ def find_blender():
 
 worker_process = None
 worker_ready = False
-_worker_lock = threading.Lock()  # Protects: worker_process, worker_ready
+_worker_lock = threading.Lock()  # Protects: worker_process, worker_ready, _worker_restart_attempts
+_worker_restart_attempts = 0  # Track consecutive restart attempts
 
 def start_worker():
     """Launch persistent Blender process with render_worker.py."""
@@ -146,8 +147,63 @@ def _ping_worker():
         return False
 
 
+def _health_check_worker():
+    """Health check endpoint — verifies worker is alive."""
+    try:
+        data = json.dumps({"type": "health"}).encode("utf-8")
+        req = urllib.request.Request(
+            f"http://localhost:{WORKER_PORT}",
+            data=data,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+        return result.get("status") == "ok"
+    except Exception:
+        return False
+
+
 def send_to_worker(data, timeout=30):
-    """Forward a request to the persistent Blender worker."""
+    """Forward a request to the persistent Blender worker with auto-restart on failure."""
+    global worker_process, _worker_restart_attempts
+
+    # Check if worker process is dead
+    with _worker_lock:
+        proc = worker_process
+        attempts = _worker_restart_attempts
+
+    if proc and proc.poll() is not None:
+        # Worker process is dead
+        log.warning(f"Worker process died (attempt {attempts + 1}/3), attempting auto-restart...")
+
+        if attempts < 3:
+            with _worker_lock:
+                _worker_restart_attempts += 1
+
+            # Attempt to restart
+            if start_worker():
+                log.info("Worker auto-restart succeeded")
+                time.sleep(1)  # Brief delay before retry
+                # Retry the send
+                try:
+                    body = json.dumps(data).encode("utf-8")
+                    req = urllib.request.Request(
+                        f"http://localhost:{WORKER_PORT}",
+                        data=body,
+                        headers={"Content-Type": "application/json"},
+                    )
+                    with urllib.request.urlopen(req, timeout=timeout) as resp:
+                        return json.loads(resp.read().decode("utf-8"))
+                except Exception as e:
+                    return {"type": "error", "message": f"Worker error after restart: {e}"}
+            else:
+                log.error("Worker auto-restart failed")
+                return {"type": "error", "message": "Worker auto-restart failed"}
+        else:
+            log.error("Worker restart attempts exhausted (max 3)")
+            return {"type": "error", "message": "Worker restart attempts exhausted"}
+
+    # Worker is alive, proceed with send
     try:
         body = json.dumps(data).encode("utf-8")
         req = urllib.request.Request(
@@ -156,8 +212,15 @@ def send_to_worker(data, timeout=30):
             headers={"Content-Type": "application/json"},
         )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            result = json.loads(resp.read().decode("utf-8"))
+        # Reset restart attempts on successful send
+        with _worker_lock:
+            _worker_restart_attempts = 0
+        return result
     except Exception as e:
+        # Connection error — worker may have died
+        log.warning(f"Send to worker failed: {e}")
+        # Don't retry here — let the caller handle or next send attempt will trigger restart check
         return {"type": "error", "message": f"Worker error: {e}"}
 
 
@@ -230,6 +293,14 @@ def handle_message(data):
             "version": "3.0.0",
             "build": "b36",
             "worker_ready": ready,
+        }
+
+    # ── Health check ──
+    elif msg_type == "health":
+        return {
+            "type": "health",
+            "status": "ok",
+            "timestamp": time.time(),
         }
 
     # ── Scene Upload → forward to worker ──
