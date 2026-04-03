@@ -26,19 +26,26 @@ class RenderHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         """Handle POST requests"""
+        print(f"[Server] Received POST request from {self.client_address[0]}", file=sys.stderr)
+
         try:
             client_ip = self.client_address[0]
-        except:
+        except Exception as e:
             client_ip = 'unknown'
-
-        # Read request body
-        content_length = int(self.headers.get('Content-Length', 0))
-        body = self.rfile.read(content_length)
+            print(f"[Server] Error getting client IP: {e}", file=sys.stderr)
 
         try:
+            # Read request body
+            content_length = int(self.headers.get('Content-Length', 0))
+            print(f"[Server] Content-Length: {content_length}", file=sys.stderr)
+
+            body = self.rfile.read(content_length)
+            print(f"[Server] Body: {body}", file=sys.stderr)
+
             data = json.loads(body.decode('utf-8'))
             msg_type = data.get('type', 'unknown')
             logger.info(f"Received {msg_type} from {client_ip}")
+            print(f"[Server] Parsed message type: {msg_type}", file=sys.stderr)
 
             response = None
 
@@ -69,26 +76,39 @@ class RenderHandler(BaseHTTPRequestHandler):
                     'message': f'Unknown message type: {msg_type}'
                 }
 
+            print(f"[Server] Sending response: {response}", file=sys.stderr)
+
             # Send response
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', len(json.dumps(response).encode('utf-8')))
             self.end_headers()
             self.wfile.write(json.dumps(response).encode('utf-8'))
+            self.wfile.flush()
             logger.info(f"Sent response for {msg_type}")
+            print(f"[Server] Response sent successfully", file=sys.stderr)
 
         except json.JSONDecodeError as e:
+            print(f"[Server] JSON decode error: {e}", file=sys.stderr)
             logger.error(f"Invalid JSON from {client_ip}: {e}")
-            self.send_response(400)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps({'error': 'Invalid JSON'}).encode('utf-8'))
+            try:
+                self.send_response(400)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({'error': 'Invalid JSON'}).encode('utf-8'))
+            except Exception as write_err:
+                print(f"[Server] Error writing response: {write_err}", file=sys.stderr)
 
         except Exception as e:
+            print(f"[Server] Unexpected error: {type(e).__name__}: {e}", file=sys.stderr)
             logger.error(f"Error processing request: {e}")
-            self.send_response(500)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps({'error': str(e)}).encode('utf-8'))
+            try:
+                self.send_response(500)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({'error': str(e)}).encode('utf-8'))
+            except Exception as write_err:
+                print(f"[Server] Error writing error response: {write_err}", file=sys.stderr)
 
     def log_message(self, format, *args):
         """Suppress default HTTP logging"""
