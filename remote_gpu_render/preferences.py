@@ -66,10 +66,11 @@ class REMOTEGPU_PT_render_panel(bpy.types.Panel):
     bl_space_type = "PROPERTIES"
     bl_region_type = "WINDOW"
     bl_context = "render"
+    COMPAT_ENGINES = {'REMOTE_GPU'}
 
     @classmethod
     def poll(cls, context):
-        return context.engine == "REMOTE_GPU"
+        return context.engine in cls.COMPAT_ENGINES
 
     def draw(self, context):
         layout = self.layout
